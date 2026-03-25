@@ -4,36 +4,6 @@ Panel Líder + Panel General | Fuente de datos: Yahoo Finance (sin API key)
 
 ---
 
-## ⚙️ Instalación
-
-### Opción A — Local (recomendado)
-
-```bash
-# 1. Crear entorno virtual (opcional pero recomendado)
-python -m venv venv
-source venv/bin/activate        # Linux / Mac
-venv\Scripts\activate           # Windows
-
-# 2. Instalar dependencias
-pip install -r requirements.txt
-
-# 3. Correr la app
-streamlit run app.py
-```
-
-La app abre automáticamente en `http://localhost:8501`
-
----
-
-### Opción B — Streamlit Cloud (free tier)
-
-1. Subir este repositorio a GitHub (repo público o privado)
-2. Ir a [share.streamlit.io](https://share.streamlit.io)
-3. Conectar el repo y apuntar a `app.py`
-4. Deploy → URL pública lista en ~2 minutos
-
----
-
 ## 🧰 Indicadores implementados
 
 | Indicador | Parámetros | Uso en swing trading |
@@ -63,16 +33,6 @@ El score va de **-10 a +10** (aproximado, puede ir algo más allá).
 
 ---
 
-## 📁 Estructura
-
-```
-bcba_analyzer/
-├── app.py            ← App principal (único archivo Python)
-├── requirements.txt  ← Dependencias
-└── README.md         ← Este archivo
-```
-
----
 
 ## ⚠️ Disclaimer
 
