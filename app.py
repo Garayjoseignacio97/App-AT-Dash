@@ -516,6 +516,868 @@ def build_chart(df: pd.DataFrame, ticker: str, metrics: dict) -> go.Figure:
     return fig
 
 
+# ─── BACKTESTER ───────────────────────────────────────────────────────────────
+
+def compute_score_series(df: pd.DataFrame) -> pd.Series:
+    """Calcula el score técnico para cada fecha del DataFrame (rolling)."""
+    close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+    rsi_s              = rsi(close)
+    macd_l, macd_sig, macd_h = macd(close)
+    _, _, _, pct_b_s, bb_w_s = bollinger(close)
+    k_s, d_s           = stochastic(high, low, close)
+    rvol_s             = rvol(volume)
+    sma20_s            = close.rolling(20).mean()
+    sma50_s            = close.rolling(50).mean()
+
+    scores = pd.Series(np.nan, index=df.index, dtype=float)
+    for i in range(55, len(df)):
+        s = 0
+        mv,  sv  = float(macd_l.iloc[i]),   float(macd_sig.iloc[i])
+        mvp, svp = float(macd_l.iloc[i-1]), float(macd_sig.iloc[i-1])
+        mhv, mhp = float(macd_h.iloc[i]),   float(macd_h.iloc[i-1])
+
+        if mv > sv and mvp <= svp:   s += 2
+        elif mv < sv and mvp >= svp: s -= 2
+        elif mv > sv:                s += 1
+        else:                        s -= 1
+        if mhv > 0 and mhv > mhp:   s += 1
+        elif mhv < 0 and mhv < mhp: s -= 1
+
+        rv = float(rsi_s.iloc[i])
+        if 45 <= rv <= 65:   s += 1
+        elif rv > 70:        s -= 1
+        elif rv < 30:        s += 1
+
+        pb = float(pct_b_s.iloc[i])
+        bw = float(bb_w_s.iloc[i])
+        if pb > 1.0:                 s -= 1
+        elif pb < 0.0:               s += 1
+        elif 0.45 <= pb <= 0.55:     s += 1
+        if not np.isnan(bw) and bw < 0.05: s += 1
+
+        kv, dv = float(k_s.iloc[i]), float(d_s.iloc[i])
+        kp, dp = float(k_s.iloc[i-1]), float(d_s.iloc[i-1])
+        if kv > dv and kp <= dp and kv < 80:  s += 2
+        elif kv < dv and kp >= dp and kv > 20: s -= 2
+
+        rv2 = float(rvol_s.iloc[i])
+        if rv2 > 2.5:   s += 2
+        elif rv2 > 1.5: s += 1
+        elif rv2 < 0.5: s -= 1
+
+        p, s20, s50 = float(close.iloc[i]), float(sma20_s.iloc[i]), float(sma50_s.iloc[i])
+        if p > s20 > s50:   s += 1
+        elif p < s20 < s50: s -= 1
+
+        scores.iloc[i] = s
+    return scores
+
+
+def run_backtest(
+    df: pd.DataFrame,
+    score_s: pd.Series,
+    entry_threshold: int = 3,
+    hold_days: int = 10,
+    stop_pct: float = 0.05,
+    target_pct: float = 0.10,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Backtester de una sola acción.
+    Retorna: (trades_df, equity_series, bh_series)
+    """
+    trades   = []
+    in_trade = False
+    entry_price = entry_date = entry_score = None
+    days_held   = 0
+    capital     = 100.0
+    equity_vals = [100.0]
+    equity_idx  = [df.index[0]]
+
+    for i in range(1, len(df)):
+        date  = df.index[i]
+        price = float(df["Close"].iloc[i])
+        sc    = score_s.iloc[i] if not np.isnan(score_s.iloc[i]) else 0
+
+        if in_trade:
+            days_held += 1
+            ret = price / entry_price - 1
+            reason = None
+            if ret <= -stop_pct:              reason = "🛑 Stop Loss"
+            elif ret >= target_pct:           reason = "🎯 Target"
+            elif days_held >= hold_days:      reason = "⏱ Tiempo"
+
+            if reason:
+                trades.append({
+                    "Ticker":         "—",
+                    "Entrada":        entry_date.strftime("%d/%m/%y"),
+                    "Salida":         date.strftime("%d/%m/%y"),
+                    "Días":           days_held,
+                    "Precio entrada": round(entry_price, 2),
+                    "Precio salida":  round(price, 2),
+                    "Retorno %":      round(ret * 100, 2),
+                    "Score entrada":  entry_score,
+                    "Motivo salida":  reason,
+                    "_ret":           ret,
+                })
+                capital  *= (1 + ret)
+                in_trade  = False
+        else:
+            if sc >= entry_threshold and not np.isnan(sc):
+                in_trade    = True
+                entry_price = price
+                entry_date  = date
+                entry_score = sc
+                days_held   = 0
+
+        equity_vals.append(capital)
+        equity_idx.append(date)
+
+    equity_s = pd.Series(equity_vals, index=equity_idx)
+    # Buy & hold
+    bh_start = float(df["Close"].iloc[0])
+    bh_s     = df["Close"] / bh_start * 100
+
+    return pd.DataFrame(trades), equity_s, bh_s
+
+
+def backtest_metrics(trades_df: pd.DataFrame, equity_s: pd.Series, bh_s: pd.Series) -> dict:
+    """Calcula métricas agregadas del backtest."""
+    total_ret  = round(equity_s.iloc[-1] - 100, 2)
+    bh_ret     = round(float(bh_s.iloc[-1]) - 100, 2)
+    n_trades   = len(trades_df)
+
+    if n_trades == 0:
+        return {
+            "Total Return %": total_ret, "B&H Return %": bh_ret,
+            "N° Operaciones": 0, "Win Rate %": 0, "Profit Factor": 0,
+            "Sharpe": 0, "Max Drawdown %": 0, "Avg días": 0,
+        }
+
+    wins      = trades_df[trades_df["_ret"] > 0]
+    losses    = trades_df[trades_df["_ret"] <= 0]
+    win_rate  = round(len(wins) / n_trades * 100, 1)
+    gross_win = wins["_ret"].sum() if len(wins) else 0
+    gross_los = abs(losses["_ret"].sum()) if len(losses) else 1e-9
+    pf        = round(gross_win / gross_los, 2) if gross_los else 0
+
+    # Drawdown
+    roll_max  = equity_s.cummax()
+    dd        = (equity_s - roll_max) / roll_max * 100
+    max_dd    = round(dd.min(), 2)
+
+    # Sharpe (daily returns de la equity curve, anualizado)
+    daily_ret = equity_s.pct_change().dropna()
+    sharpe    = round((daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+                      if daily_ret.std() > 0 else 0, 2)
+
+    avg_dias  = round(trades_df["Días"].mean(), 1)
+
+    return {
+        "Total Return %": total_ret,
+        "B&H Return %":   bh_ret,
+        "N° Operaciones": n_trades,
+        "Win Rate %":     win_rate,
+        "Profit Factor":  pf,
+        "Sharpe":         sharpe,
+        "Max Drawdown %": max_dd,
+        "Avg días":       avg_dias,
+    }
+
+
+def build_equity_chart(equity_s: pd.Series, bh_s: pd.Series, ticker: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=equity_s.index, y=equity_s.values,
+        name="Estrategia", line=dict(color="#00d4aa", width=2),
+        fill="tozeroy", fillcolor="rgba(0,212,170,0.06)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=bh_s.index, y=bh_s.values,
+        name="Buy & Hold", line=dict(color="#f59e0b", width=1.5, dash="dash"),
+    ))
+    fig.add_hline(y=100, line_color="rgba(255,255,255,0.15)", line_width=1)
+    fig.update_layout(
+        template="plotly_dark",
+        height=340,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=30, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08),
+        title=dict(text=f"Equity Curve — {ticker}", font=dict(size=12, color="#94a3b8")),
+        yaxis=dict(ticksuffix="%", gridcolor="rgba(255,255,255,0.04)"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+    )
+    return fig
+
+
+def build_score_chart(score_s: pd.Series, df: pd.DataFrame,
+                      entry_threshold: int, trades_df: pd.DataFrame) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.55, 0.45], vertical_spacing=0.04,
+                        subplot_titles=["Precio + Operaciones", "Score técnico"])
+
+    close = df["Close"]
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=close, close=close,
+        name="Precio",
+        increasing_line_color="#00d4aa", increasing_fillcolor="#00d4aa",
+        decreasing_line_color="#ff4b6b", decreasing_fillcolor="#ff4b6b",
+        line=dict(width=1),
+    ), row=1, col=1)
+
+    # Markers de entrada y salida
+    if not trades_df.empty:
+        entry_dates = pd.to_datetime(trades_df["Entrada"], format="%d/%m/%y", errors="coerce")
+        exit_dates  = pd.to_datetime(trades_df["Salida"],  format="%d/%m/%y", errors="coerce")
+        entry_prices = trades_df["Precio entrada"].values
+        exit_prices  = trades_df["Precio salida"].values
+        rets         = trades_df["_ret"].values
+
+        fig.add_trace(go.Scatter(
+            x=entry_dates, y=entry_prices, mode="markers",
+            marker=dict(symbol="triangle-up", size=10, color="#00d4aa", line=dict(width=1, color="#fff")),
+            name="Entrada", hovertemplate="Entrada: $%{y:,.2f}<extra></extra>",
+        ), row=1, col=1)
+
+        exit_colors = ["#4ade80" if r > 0 else "#f87171" for r in rets]
+        fig.add_trace(go.Scatter(
+            x=exit_dates, y=exit_prices, mode="markers",
+            marker=dict(symbol="triangle-down", size=10, color=exit_colors,
+                        line=dict(width=1, color="#fff")),
+            name="Salida", hovertemplate="Salida: $%{y:,.2f}<extra></extra>",
+        ), row=1, col=1)
+
+    # Score series
+    score_clean = score_s.dropna()
+    score_colors = ["#00d4aa" if v >= entry_threshold else
+                    "#fbbf24" if v >= 0 else "#f87171"
+                    for v in score_clean.values]
+    fig.add_trace(go.Bar(
+        x=score_clean.index, y=score_clean.values,
+        marker_color=score_colors, opacity=0.75,
+        name="Score", showlegend=False,
+    ), row=2, col=1)
+    fig.add_hline(y=entry_threshold, line_dash="dash", line_color="#00d4aa",
+                  opacity=0.7, annotation_text=f"Umbral entrada ({entry_threshold})",
+                  annotation_font_size=10, row=2, col=1)
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.15)", line_width=1, row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=600,
+        xaxis_rangeslider_visible=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=36, b=0),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(gridcolor="rgba(255,255,255,0.04)", zeroline=False)
+    fig.update_xaxes(gridcolor="rgba(255,255,255,0.04)",
+                     rangebreaks=[dict(bounds=["sat", "mon"])])
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=11, color="#94a3b8")
+    return fig
+
+
+
+# ─── ANÁLISIS FUNDAMENTAL ─────────────────────────────────────────────────────
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_fundamentals(tickers_tuple: tuple) -> dict[str, dict]:
+    """
+    Descarga métricas fundamentales desde yfinance.info.
+    Cache de 24 horas (los fundamentales no cambian intradía).
+    """
+    result = {}
+    def _fetch(ticker: str):
+        try:
+            info = yf.Ticker(ticker).info
+            result[ticker] = {
+                # Valuación
+                "pe":          info.get("trailingPE"),
+                "pb":          info.get("priceToBook"),
+                "ev_ebitda":   info.get("enterpriseToEbitda"),
+                # Rentabilidad
+                "roe":         info.get("returnOnEquity"),
+                "roa":         info.get("returnOnAssets"),
+                "margen_neto": info.get("profitMargins"),
+                # Deuda
+                "debt_eq":     info.get("debtToEquity"),
+                "current":     info.get("currentRatio"),
+                # Dividendos
+                "div_yield":   info.get("dividendYield"),
+                "payout":      info.get("payoutRatio"),
+                # Extra
+                "market_cap":  info.get("marketCap"),
+                "sector":      info.get("sector"),
+                "employees":   info.get("fullTimeEmployees"),
+            }
+        except Exception:
+            result[ticker] = {}
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        pool.map(_fetch, list(tickers_tuple))
+    return result
+
+
+def score_fundamentals(f: dict) -> tuple[int, list[str]]:
+    """
+    Score fundamental basado en múltiplos, rentabilidad, deuda y dividendos.
+    Rango aproximado: -8 a +10. Positivo = fundamentals favorables.
+    """
+    score = 0
+    signals = []
+
+    def val(key): return f.get(key)
+
+    # ── Valuación ──
+    pe = val("pe")
+    if pe is not None and pe > 0:
+        if pe < 10:
+            score += 2; signals.append(f"✅ P/E bajo ({pe:.1f}x) — valuación atractiva")
+        elif pe < 20:
+            score += 1; signals.append(f"✅ P/E moderado ({pe:.1f}x)")
+        elif pe < 35:
+            signals.append(f"👁️ P/E elevado ({pe:.1f}x)")
+        else:
+            score -= 1; signals.append(f"⚠️ P/E muy alto ({pe:.1f}x) — valuación exigente")
+    elif pe is not None and pe < 0:
+        score -= 1; signals.append("🔴 P/E negativo — empresa con pérdidas")
+
+    pb = val("pb")
+    if pb is not None:
+        if pb < 1:
+            score += 2; signals.append(f"✅ P/B bajo ({pb:.2f}x) — cotiza bajo valor libro")
+        elif pb < 2:
+            score += 1; signals.append(f"✅ P/B razonable ({pb:.2f}x)")
+        elif pb < 4:
+            signals.append(f"👁️ P/B elevado ({pb:.2f}x)")
+        else:
+            score -= 1; signals.append(f"⚠️ P/B muy alto ({pb:.2f}x)")
+
+    ev = val("ev_ebitda")
+    if ev is not None and ev > 0:
+        if ev < 8:
+            score += 2; signals.append(f"✅ EV/EBITDA bajo ({ev:.1f}x) — empresa barata")
+        elif ev < 15:
+            score += 1; signals.append(f"✅ EV/EBITDA moderado ({ev:.1f}x)")
+        else:
+            score -= 1; signals.append(f"⚠️ EV/EBITDA alto ({ev:.1f}x)")
+
+    # ── Rentabilidad ──
+    roe = val("roe")
+    if roe is not None:
+        roe_pct = roe * 100
+        if roe_pct > 20:
+            score += 2; signals.append(f"✅ ROE alto ({roe_pct:.1f}%) — alta rentabilidad del patrimonio")
+        elif roe_pct > 10:
+            score += 1; signals.append(f"✅ ROE positivo ({roe_pct:.1f}%)")
+        elif roe_pct > 0:
+            signals.append(f"👁️ ROE bajo ({roe_pct:.1f}%)")
+        else:
+            score -= 1; signals.append(f"🔴 ROE negativo ({roe_pct:.1f}%)")
+
+    roa = val("roa")
+    if roa is not None:
+        roa_pct = roa * 100
+        if roa_pct > 10:
+            score += 1; signals.append(f"✅ ROA alto ({roa_pct:.1f}%)")
+        elif roa_pct > 5:
+            signals.append(f"👁️ ROA moderado ({roa_pct:.1f}%)")
+        elif roa_pct < 0:
+            score -= 1; signals.append(f"🔴 ROA negativo ({roa_pct:.1f}%)")
+
+    mn = val("margen_neto")
+    if mn is not None:
+        mn_pct = mn * 100
+        if mn_pct > 20:
+            score += 2; signals.append(f"✅ Margen neto alto ({mn_pct:.1f}%)")
+        elif mn_pct > 10:
+            score += 1; signals.append(f"✅ Margen neto positivo ({mn_pct:.1f}%)")
+        elif mn_pct > 0:
+            signals.append(f"👁️ Margen neto bajo ({mn_pct:.1f}%)")
+        else:
+            score -= 1; signals.append(f"🔴 Margen neto negativo ({mn_pct:.1f}%)")
+
+    # ── Deuda ──
+    de = val("debt_eq")
+    if de is not None:
+        de_v = de / 100 if de > 10 else de   # yfinance a veces devuelve en %
+        if de_v < 0.3:
+            score += 1; signals.append(f"✅ Deuda/Patrimonio bajo ({de_v:.2f}x) — balance sólido")
+        elif de_v < 1.0:
+            signals.append(f"👁️ Deuda/Patrimonio moderado ({de_v:.2f}x)")
+        elif de_v < 2.0:
+            score -= 1; signals.append(f"⚠️ Deuda/Patrimonio elevado ({de_v:.2f}x)")
+        else:
+            score -= 2; signals.append(f"🔴 Deuda/Patrimonio muy alto ({de_v:.2f}x) — riesgo financiero")
+
+    cr = val("current")
+    if cr is not None:
+        if cr > 2:
+            score += 1; signals.append(f"✅ Current Ratio alto ({cr:.2f}x) — buena liquidez")
+        elif cr > 1:
+            signals.append(f"👁️ Current Ratio ajustado ({cr:.2f}x)")
+        else:
+            score -= 1; signals.append(f"🔴 Current Ratio < 1 ({cr:.2f}x) — riesgo de liquidez")
+
+    # ── Dividendos ──
+    dy = val("div_yield")
+    if dy is not None and dy > 0:
+        dy_pct = dy * 100
+        if dy_pct > 5:
+            score += 2; signals.append(f"✅ Dividend Yield alto ({dy_pct:.1f}%) — renta atractiva")
+        elif dy_pct > 2:
+            score += 1; signals.append(f"✅ Dividend Yield moderado ({dy_pct:.1f}%)")
+        else:
+            signals.append(f"👁️ Dividend Yield bajo ({dy_pct:.1f}%)")
+
+    po = val("payout")
+    if po is not None:
+        po_pct = po * 100
+        if po_pct > 100:
+            score -= 1; signals.append(f"⚠️ Payout Ratio > 100% ({po_pct:.0f}%) — dividendo insostenible")
+        elif po_pct > 80:
+            signals.append(f"👁️ Payout Ratio alto ({po_pct:.0f}%)")
+
+    return score, signals
+
+
+def rec_fundamental(score: int) -> tuple[str, str]:
+    """Retorna (etiqueta, color_hex) para el score fundamental."""
+    if score >= 8:   return "MUY SÓLIDO",  "#00d4aa"
+    if score >= 5:   return "SÓLIDO",       "#4ade80"
+    if score >= 2:   return "NEUTRO",       "#fbbf24"
+    if score >= -1:  return "DÉBIL",        "#f87171"
+    return               "MUY DÉBIL",   "#ff4b6b"
+
+
+def fmt(val, fmt_str="", suffix="", prefix="", na="N/D"):
+    """Formatea un valor fundamental, devuelve N/D si es None."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return na
+    try:
+        if fmt_str:
+            return prefix + format(val, fmt_str) + suffix
+        return prefix + str(val) + suffix
+    except Exception:
+        return na
+
+
+def build_fundamental_radar(f: dict, ticker: str) -> go.Figure:
+    """Gráfico radar con las 6 dimensiones fundamentales normalizadas 0-10."""
+    def norm(val, lo, hi):
+        if val is None or np.isnan(float(val if val else 0)): return 5
+        return round(max(0, min(10, (float(val) - lo) / (hi - lo) * 10)), 1)
+
+    roe = f.get("roe") or 0
+    roa = f.get("roa") or 0
+    mn  = f.get("margen_neto") or 0
+    pe  = f.get("pe") or 30
+    pb  = f.get("pb") or 3
+    de  = f.get("debt_eq") or 100
+    cr  = f.get("current") or 1
+    dy  = f.get("div_yield") or 0
+
+    dims = {
+        "Valuación":     norm(30 - min(pe, 30), 0, 30),
+        "ROE":           norm(roe * 100, -10, 30),
+        "ROA":           norm(roa * 100, -5, 15),
+        "Margen":        norm(mn * 100, -10, 30),
+        "Solidez deuda": norm(2 - min(de/100 if de > 10 else de, 2), 0, 2),
+        "Liquidez":      norm(cr, 0, 3),
+    }
+
+    cats   = list(dims.keys()) + [list(dims.keys())[0]]
+    values = list(dims.values()) + [list(dims.values())[0]]
+
+    fig = go.Figure(go.Scatterpolar(
+        r=values, theta=cats,
+        fill="toself",
+        fillcolor="rgba(0,212,170,0.15)",
+        line=dict(color="#00d4aa", width=2),
+        name=ticker,
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 10],
+                            gridcolor="rgba(255,255,255,0.1)",
+                            tickfont=dict(size=9, color="#94a3b8")),
+            angularaxis=dict(gridcolor="rgba(255,255,255,0.1)",
+                             tickfont=dict(size=11, color="#cbd5e1")),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        template="plotly_dark",
+        height=320,
+        margin=dict(l=40, r=40, t=40, b=40),
+        showlegend=False,
+        title=dict(text=f"Perfil fundamental — {ticker}",
+                   font=dict(size=12, color="#94a3b8"), x=0.5),
+    )
+    return fig
+
+
+
+# ─── PANEL MACRO ARGENTINO ───────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_macro() -> dict:
+    """
+    Obtiene variables macro argentinas desde APIs públicas.
+    - Tipos de cambio: dolarapi.com
+    - Riesgo país: ambito.com
+    Cache: 5 minutos.
+    """
+    result = {
+        "oficial": None, "blue": None, "mep": None, "ccl": None,
+        "brecha_blue": None, "brecha_ccl": None, "riesgo_pais": None,
+        "error": False,
+    }
+
+    # ── Tipos de cambio ──
+    try:
+        import urllib.request, json as _json
+        req = urllib.request.Request(
+            "https://dolarapi.com/v1/dolares",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            dolares = _json.loads(r.read().decode())
+        for d in dolares:
+            casa = d.get("casa", "").lower()
+            venta = d.get("venta")
+            if casa == "oficial"         : result["oficial"] = venta
+            elif casa == "blue"          : result["blue"]    = venta
+            elif casa == "bolsa"         : result["mep"]     = venta
+            elif casa == "contadoconliqui": result["ccl"]    = venta
+    except Exception:
+        result["error"] = True
+
+    # ── Brecha ──
+    if result["oficial"] and result["oficial"] > 0:
+        if result["blue"]:
+            result["brecha_blue"] = round((result["blue"] / result["oficial"] - 1) * 100, 1)
+        if result["ccl"]:
+            result["brecha_ccl"]  = round((result["ccl"]  / result["oficial"] - 1) * 100, 1)
+
+    # ── Riesgo país ──
+    try:
+        import urllib.request, json as _json
+        req2 = urllib.request.Request(
+            "https://mercados.ambito.com/riesgo-pais/referencia",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req2, timeout=6) as r:
+            rp_data = _json.loads(r.read().decode())
+        val = rp_data.get("valor") or rp_data.get("ultimo") or rp_data.get("value")
+        if val:
+            result["riesgo_pais"] = float(str(val).replace(",", ".").replace(".", "", str(val).count(".")-1))
+    except Exception:
+        pass
+
+    return result
+
+
+def render_macro_panel():
+    """Renderiza el panel macro como una fila compacta de métricas."""
+    macro = fetch_macro()
+
+    def _fmt_dolar(val):
+        return f"${val:,.0f}" if val else "—"
+
+    def _brecha_color(val):
+        if val is None: return "#94a3b8"
+        if val < 20:    return "#4ade80"
+        if val < 50:    return "#fbbf24"
+        return "#f87171"
+
+    def _rp_color(val):
+        if val is None: return "#94a3b8"
+        if val < 800:   return "#4ade80"
+        if val < 1500:  return "#fbbf24"
+        return "#f87171"
+
+    ofic  = _fmt_dolar(macro["oficial"])
+    blue  = _fmt_dolar(macro["blue"])
+    mep   = _fmt_dolar(macro["mep"])
+    ccl   = _fmt_dolar(macro["ccl"])
+    b_bl  = f"{macro['brecha_blue']:+.1f}%" if macro["brecha_blue"] is not None else "—"
+    b_ccl = f"{macro['brecha_ccl']:+.1f}%"  if macro["brecha_ccl"]  is not None else "—"
+    rp    = f"{macro['riesgo_pais']:,.0f} bps" if macro["riesgo_pais"] else "—"
+
+    bc  = _brecha_color(macro["brecha_ccl"])
+    bbc = _brecha_color(macro["brecha_blue"])
+    rpc = _rp_color(macro["riesgo_pais"])
+
+    st.markdown(f"""
+    <div style="background:#13161f;border:1px solid #1e2235;border-radius:10px;
+                padding:10px 20px;margin-bottom:14px;display:flex;
+                align-items:center;gap:0;flex-wrap:wrap">
+      <span style="color:#94a3b8;font-size:11px;font-weight:600;
+                   letter-spacing:.05em;margin-right:18px">🌐 MACRO AR</span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">Oficial </span>
+        <span style="color:#e2e8f0;font-weight:700">{ofic}</span>
+      </span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">Blue </span>
+        <span style="color:#e2e8f0;font-weight:700">{blue}</span>
+      </span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">MEP </span>
+        <span style="color:#e2e8f0;font-weight:700">{mep}</span>
+      </span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">CCL </span>
+        <span style="color:#e2e8f0;font-weight:700">{ccl}</span>
+      </span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">Brecha CCL </span>
+        <span style="color:{bc};font-weight:700">{b_ccl}</span>
+      </span>
+      <span style="margin-right:22px;font-size:13px">
+        <span style="color:#64748b">Brecha Blue </span>
+        <span style="color:{bbc};font-weight:700">{b_bl}</span>
+      </span>
+      <span style="font-size:13px">
+        <span style="color:#64748b">Riesgo País </span>
+        <span style="color:{rpc};font-weight:700">{rp}</span>
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ─── CEDEARS ─────────────────────────────────────────────────────────────────
+
+CEDEARS: dict[str, tuple[str, str, int]] = {
+    # ticker.BA : (nombre, ticker_usd_yf, ratio_cedear)
+    "AAPL.BA":  ("Apple",           "AAPL",  10),
+    "MSFT.BA":  ("Microsoft",       "MSFT",  10),
+    "GOOGL.BA": ("Alphabet",        "GOOGL", 10),
+    "AMZN.BA":  ("Amazon",          "AMZN",  10),
+    "TSLA.BA":  ("Tesla",           "TSLA",  10),
+    "META.BA":  ("Meta",            "META",  10),
+    "NVDA.BA":  ("Nvidia",          "NVDA",  10),
+    "BABA.BA":  ("Alibaba",         "BABA",   5),
+    "MELI.BA":  ("MercadoLibre",    "MELI",   1),
+    "GLOB.BA":  ("Globant",         "GLOB",   1),
+    "AMD.BA":   ("AMD",             "AMD",   10),
+    "INTC.BA":  ("Intel",           "INTC",  10),
+    "QCOM.BA":  ("Qualcomm",        "QCOM",  10),
+    "KO.BA":    ("Coca-Cola",       "KO",    10),
+    "DIS.BA":   ("Disney",          "DIS",   10),
+    "WMT.BA":   ("Walmart",         "WMT",   10),
+    "JPM.BA":   ("JPMorgan",        "JPM",   10),
+    "GS.BA":    ("Goldman Sachs",   "GS",    10),
+    "XOM.BA":   ("ExxonMobil",      "XOM",   10),
+    "GOLD.BA":  ("Barrick Gold",    "GOLD",  10),
+    "BAC.BA":   ("Bank of America", "BAC",   10),
+    "PBR.BA":   ("Petrobras",       "PBR",   10),
+}
+
+CEDEAR_SECTORS = {
+    "AAPL.BA":"Tecnología","MSFT.BA":"Tecnología","GOOGL.BA":"Tecnología",
+    "AMZN.BA":"Tecnología","TSLA.BA":"Automotriz","META.BA":"Tecnología",
+    "NVDA.BA":"Tecnología","BABA.BA":"Tecnología","MELI.BA":"Tecnología",
+    "GLOB.BA":"Tecnología","AMD.BA":"Tecnología","INTC.BA":"Tecnología",
+    "QCOM.BA":"Tecnología","KO.BA":"Consumo","DIS.BA":"Entretenimiento",
+    "WMT.BA":"Consumo","JPM.BA":"Financiero","GS.BA":"Financiero",
+    "XOM.BA":"Energía","GOLD.BA":"Materiales","BAC.BA":"Financiero",
+    "PBR.BA":"Energía",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_cedears(ccl: float | None) -> pd.DataFrame:
+    """
+    Descarga precios ARS y USD de cada CEDEAR y calcula el CCL implícito.
+    """
+    if not ccl or ccl <= 0:
+        ccl = 1200.0   # fallback si no hay dato macro
+
+    tickers_ba  = list(CEDEARS.keys())
+    tickers_usd = list(set(v[1] for v in CEDEARS.values()))
+
+    rows = []
+    try:
+        # Precios ARS (batch)
+        raw_ar = yf.download(tickers_ba, period="5d", auto_adjust=True,
+                             progress=False, threads=True)
+        # Precios USD (batch)
+        raw_us = yf.download(tickers_usd, period="5d", auto_adjust=True,
+                             progress=False, threads=True)
+    except Exception:
+        return pd.DataFrame()
+
+    def _last(raw, ticker):
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                s = raw["Close"][ticker].dropna()
+            else:
+                s = raw["Close"].dropna()
+            return float(s.iloc[-1]) if len(s) else None
+        except Exception:
+            return None
+
+    for ticker_ba, (nombre, ticker_usd, ratio) in CEDEARS.items():
+        p_ar  = _last(raw_ar, ticker_ba)
+        p_us  = _last(raw_us, ticker_usd)
+        if p_ar is None or p_us is None or p_us == 0:
+            continue
+
+        ccl_impl  = round(p_ar / (p_us / ratio), 2)  # cada 1 acción US = ratio CEDEARs
+        premium   = round((ccl_impl / ccl - 1) * 100, 2)
+        sector    = CEDEAR_SECTORS.get(ticker_ba, "—")
+        sym       = ticker_ba.replace(".BA", "")
+
+        rows.append({
+            "Ticker":       sym,
+            "Nombre":       nombre,
+            "Sector":       sector,
+            "Precio ARS $": round(p_ar, 2),
+            "Precio USD $": round(p_us, 2),
+            "Ratio":        ratio,
+            "CCL Implícito":ccl_impl,
+            "CCL Referencia":round(ccl, 2),
+            "Prima/Desc %": premium,
+            "_oport":       abs(premium),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Prima/Desc %", key=abs).reset_index(drop=True)
+    return df
+
+
+# ─── CORRELACIÓN ─────────────────────────────────────────────────────────────
+
+def build_correlation_heatmap(data: dict[str, pd.DataFrame], min_periods: int = 30) -> go.Figure:
+    """Heatmap de correlación de retornos diarios entre todos los tickers disponibles."""
+    returns = {}
+    for ticker, df in data.items():
+        sym = ticker.replace(".BA", "")
+        try:
+            r = df["Close"].pct_change().dropna()
+            if len(r) >= min_periods:
+                returns[sym] = r
+        except Exception:
+            continue
+
+    if len(returns) < 2:
+        return go.Figure()
+
+    ret_df  = pd.DataFrame(returns).dropna(how="all")
+    corr_df = ret_df.corr()
+    labels  = corr_df.columns.tolist()
+    matrix  = corr_df.values
+
+    # Colorscale divergente centrada en 0
+    fig = go.Figure(go.Heatmap(
+        z=matrix,
+        x=labels, y=labels,
+        colorscale=[
+            [0.0,  "#ff4b6b"],
+            [0.25, "#f87171"],
+            [0.5,  "#1e2235"],
+            [0.75, "#4ade80"],
+            [1.0,  "#00d4aa"],
+        ],
+        zmin=-1, zmax=1,
+        text=[[f"{v:.2f}" for v in row] for row in matrix],
+        texttemplate="%{text}",
+        textfont=dict(size=8, color="white"),
+        hovertemplate="<b>%{y}</b> vs <b>%{x}</b><br>Correlación: %{z:.3f}<extra></extra>",
+        colorbar=dict(
+            title="Correlación", tickvals=[-1,-0.5,0,0.5,1],
+            ticktext=["-1","−0.5","0","+0.5","+1"],
+            tickfont=dict(size=10, color="#cbd5e1"),
+            titlefont=dict(size=11, color="#cbd5e1"),
+        ),
+    ))
+
+    n = len(labels)
+    h = max(500, n * 22)
+    fig.update_layout(
+        template="plotly_dark",
+        height=h,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=10),
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
+        yaxis=dict(tickfont=dict(size=9)),
+        title=dict(text="Correlación de retornos diarios", font=dict(size=13, color="#94a3b8")),
+    )
+    return fig
+
+
+# ─── HISTORIAL DE SEÑALES ────────────────────────────────────────────────────
+
+HIST_KEY = "signal_history"   # clave en st.session_state
+
+
+def save_signal_snapshot(results_df: pd.DataFrame, macro: dict) -> None:
+    """
+    Guarda un snapshot del screener actual en session_state.
+    Cada fila lleva timestamp, macro vars y señal técnica.
+    """
+    if HIST_KEY not in st.session_state:
+        st.session_state[HIST_KEY] = []
+
+    ts  = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y-%m-%d %H:%M")
+    ccl = macro.get("ccl") or ""
+    rp  = macro.get("riesgo_pais") or ""
+
+    for _, row in results_df.iterrows():
+        st.session_state[HIST_KEY].append({
+            "Timestamp":    ts,
+            "Ticker":       row["Ticker"],
+            "Score":        row["Score"],
+            "Señal":        row["Señal"],
+            "Precio $":     row["Precio $"],
+            "Var %":        row["Var %"],
+            "RSI":          row["RSI"],
+            "RVOL":         row["RVOL"],
+            "CCL":          ccl,
+            "Riesgo País":  rp,
+        })
+
+
+def build_history_chart(hist_df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Score histórico de un ticker a lo largo del tiempo."""
+    df_t = hist_df[hist_df["Ticker"] == ticker].copy()
+    df_t["Timestamp"] = pd.to_datetime(df_t["Timestamp"])
+    df_t = df_t.sort_values("Timestamp")
+
+    fig = go.Figure()
+    bar_colors = [score_color(int(v)) for v in df_t["Score"]]
+    fig.add_trace(go.Bar(
+        x=df_t["Timestamp"], y=df_t["Score"],
+        marker_color=bar_colors, opacity=0.8, name="Score",
+        hovertemplate="<b>%{x}</b><br>Score: %{y}<extra></extra>",
+    ))
+    fig.add_hline(y=3,  line_dash="dash", line_color="#4ade80", opacity=0.6,
+                  annotation_text="Compra", annotation_font_size=10)
+    fig.add_hline(y=-2, line_dash="dash", line_color="#f87171", opacity=0.6,
+                  annotation_text="Venta", annotation_font_size=10)
+    fig.add_hline(y=0,  line_color="rgba(255,255,255,0.15)", line_width=1)
+    fig.update_layout(
+        template="plotly_dark", height=260,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=30, b=0),
+        title=dict(text=f"Evolución del score — {ticker}",
+                   font=dict(size=12, color="#94a3b8")),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+    )
+    return fig
+
+
 # ─── APP PRINCIPAL ────────────────────────────────────────────────────────────
 
 def main():
@@ -615,10 +1477,19 @@ def main():
         return
 
     results_df = pd.DataFrame(rows).sort_values("Score", ascending=False).reset_index(drop=True)
+    save_signal_snapshot(results_df, fetch_macro())
+
+    # ══ PANEL MACRO ════════════════════════════════════════════════════════
+    macro_data = fetch_macro()
+    render_macro_panel()
+
+    # ══ GUARDAR SNAPSHOT ════════════════════════════════════════════════
+    if "results_df" in dir() or True:
+        pass   # snapshot se guarda tras calcular results_df (ver abajo)
 
     # ══ TABS ═══════════════════════════════════════════════════════════════
 
-    tab1, tab2, tab3 = st.tabs(["📊 Ranking & Screener", "📈 Análisis Individual", "🔔 Alertas"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 Ranking & Screener", "📈 Análisis Individual", "🔔 Alertas", "🧪 Backtester", "📑 Análisis Fundamental", "💱 CEDEARs", "🔗 Correlación", "📜 Historial"])
 
     # ─────────────────────────────────────────────────────────────────────
     # TAB 1 — RANKING
@@ -854,6 +1725,678 @@ def main():
                 st.dataframe(top, use_container_width=True)
             else:
                 st.info("Sin señales bullish en el filtro actual.")
+
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 4 — BACKTESTER
+    # ─────────────────────────────────────────────────────────────────────
+    with tab4:
+        st.subheader("🧪 Backtester de Estrategia Técnica")
+        st.caption("Simulación histórica basada en el score técnico del screener. No incluye comisiones ni slippage.")
+
+        # ── Controles ──
+        bc1, bc2 = st.columns([1, 2])
+        with bc1:
+            bt_mode = st.radio("Modo", ["Ticker individual", "Portfolio completo"],
+                               horizontal=False)
+
+        with bc2:
+            bk1, bk2 = st.columns(2)
+            with bk1:
+                bt_entry   = st.slider("Score mínimo de entrada", 1, 8, 3, 1,
+                                       help="Score >= N para abrir posición")
+                bt_hold    = st.slider("Período de hold (ruedas)", 3, 30, 10, 1,
+                                       help="Máximo de días a mantener la posición")
+            with bk2:
+                bt_stop    = st.slider("Stop Loss %", 2, 15, 5, 1,
+                                       help="Cierra la posición si cae este %") / 100
+                bt_target  = st.slider("Target %", 3, 30, 10, 1,
+                                       help="Cierra la posición si sube este %") / 100
+
+        st.divider()
+
+        # ── Ticker individual ──
+        if bt_mode == "Ticker individual":
+            bt_ticker = st.selectbox(
+                "Seleccioná un ticker",
+                list(detail_store.keys()),
+                format_func=lambda x: f"{x}  —  {TICKERS.get(x+'.BA', ('?','?','?'))[0]}"
+            )
+
+            if bt_ticker and bt_ticker in detail_store:
+                df_bt = detail_store[bt_ticker]["df"]
+
+                with st.spinner("⏳ Calculando score histórico y simulando operaciones…"):
+                    score_s  = compute_score_series(df_bt)
+                    trades_df, equity_s, bh_s = run_backtest(
+                        df_bt, score_s, bt_entry, bt_hold, bt_stop, bt_target
+                    )
+                    trades_df["Ticker"] = bt_ticker
+                    mets = backtest_metrics(trades_df, equity_s, bh_s)
+
+                # ── Métricas resumen ──
+                m1,m2,m3,m4,m5,m6,m7,m8 = st.columns(8)
+                def _delta_color(v): return "normal" if v >= 0 else "inverse"
+
+                m1.metric("📈 Retorno estrategia", f"{mets['Total Return %']:+.1f}%",
+                          delta=f"{mets['Total Return %'] - mets['B&H Return %']:+.1f}% vs B&H")
+                m2.metric("📊 Buy & Hold",         f"{mets['B&H Return %']:+.1f}%")
+                m3.metric("🎯 Win Rate",            f"{mets['Win Rate %']}%")
+                m4.metric("⚡ Profit Factor",       f"{mets['Profit Factor']}")
+                m5.metric("📐 Sharpe",              f"{mets['Sharpe']}")
+                m6.metric("📉 Max Drawdown",        f"{mets['Max Drawdown %']:.1f}%")
+                m7.metric("🔢 Operaciones",         mets["N° Operaciones"])
+                m8.metric("⏱ Promedio días",        f"{mets['Avg días']}")
+
+                st.divider()
+
+                # ── Equity curve ──
+                st.plotly_chart(build_equity_chart(equity_s, bh_s, bt_ticker),
+                                use_container_width=True)
+
+                # ── Gráfico precio + score ──
+                st.plotly_chart(build_score_chart(score_s, df_bt, bt_entry, trades_df),
+                                use_container_width=True)
+
+                # ── Tabla de operaciones ──
+                if not trades_df.empty:
+                    st.subheader(f"📋 Operaciones simuladas ({len(trades_df)})")
+
+                    def _color_ret(val):
+                        return "color:#4ade80;font-weight:700" if val > 0 else "color:#f87171;font-weight:700"
+
+                    display_trades = trades_df.drop(columns=["_ret", "Ticker"], errors="ignore")
+                    styled_trades = (
+                        display_trades.style
+                        .map(_color_ret, subset=["Retorno %"])
+                        .format({"Precio entrada": "${:,.2f}", "Precio salida": "${:,.2f}",
+                                 "Retorno %": "{:+.2f}%"})
+                    )
+                    st.dataframe(styled_trades, use_container_width=True, height=380)
+
+                    csv_bt = display_trades.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Exportar operaciones (CSV)", csv_bt,
+                                       f"backtest_{bt_ticker}.csv", "text/csv")
+                else:
+                    st.info("Sin operaciones generadas con los parámetros actuales. Probá bajar el score de entrada o ampliar el período histórico.")
+
+        # ── Portfolio completo ──
+        else:
+            if st.button("▶️ Correr backtest de portfolio", type="primary", use_container_width=False):
+                all_trades  = []
+                equities    = {}
+                bh_returns  = {}
+
+                progress = st.progress(0, text="Procesando tickers…")
+                tickers_bt = list(detail_store.keys())
+
+                for idx, sym in enumerate(tickers_bt):
+                    progress.progress((idx + 1) / len(tickers_bt), text=f"Procesando {sym}…")
+                    df_bt = detail_store[sym]["df"]
+                    try:
+                        score_s = compute_score_series(df_bt)
+                        trd, eq_s, bh_s = run_backtest(df_bt, score_s, bt_entry, bt_hold, bt_stop, bt_target)
+                        trd["Ticker"] = sym
+                        all_trades.append(trd)
+                        equities[sym]   = eq_s
+                        bh_returns[sym] = float(bh_s.iloc[-1]) - 100
+                    except Exception:
+                        continue
+
+                progress.empty()
+
+                if not equities:
+                    st.warning("No se pudo correr el backtest en ningún ticker.")
+                else:
+                    # Equity portfolio = promedio simple de todas las curves
+                    eq_df    = pd.DataFrame(equities).ffill()
+                    eq_port  = eq_df.mean(axis=1)
+                    bh_avg   = np.mean(list(bh_returns.values()))
+
+                    all_trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+                    bh_series_fake = pd.Series(
+                        [100 + bh_avg * t / len(eq_port) for t in range(len(eq_port))],
+                        index=eq_port.index
+                    )
+                    mets_p = backtest_metrics(all_trades_df, eq_port, bh_series_fake)
+
+                    # Métricas portfolio
+                    pm1,pm2,pm3,pm4,pm5,pm6,pm7,pm8 = st.columns(8)
+                    pm1.metric("📈 Retorno portfolio",  f"{mets_p['Total Return %']:+.1f}%")
+                    pm2.metric("📊 B&H promedio",       f"{bh_avg:+.1f}%")
+                    pm3.metric("🎯 Win Rate global",    f"{mets_p['Win Rate %']}%")
+                    pm4.metric("⚡ Profit Factor",      f"{mets_p['Profit Factor']}")
+                    pm5.metric("📐 Sharpe",             f"{mets_p['Sharpe']}")
+                    pm6.metric("📉 Max Drawdown",       f"{mets_p['Max Drawdown %']:.1f}%")
+                    pm7.metric("🔢 Total operaciones",  mets_p["N° Operaciones"])
+                    pm8.metric("⏱ Avg días",            f"{mets_p['Avg días']}")
+
+                    st.divider()
+
+                    # Equity curve portfolio
+                    st.plotly_chart(
+                        build_equity_chart(eq_port, bh_series_fake, "Portfolio completo"),
+                        use_container_width=True
+                    )
+
+                    # Top performers
+                    if not all_trades_df.empty:
+                        col_tp, col_bt = st.columns(2)
+
+                        with col_tp:
+                            st.subheader("🏆 Top performers")
+                            perf = (
+                                all_trades_df.groupby("Ticker")
+                                .agg(
+                                    Operaciones=("_ret", "count"),
+                                    Retorno_total=("_ret", lambda x: round(x.sum() * 100, 2)),
+                                    Win_rate=("_ret", lambda x: round((x > 0).mean() * 100, 1)),
+                                )
+                                .sort_values("Retorno_total", ascending=False)
+                            )
+                            st.dataframe(perf.head(10), use_container_width=True)
+
+                        with col_bt:
+                            st.subheader("📋 Todas las operaciones")
+                            display_all = all_trades_df.drop(columns=["_ret"], errors="ignore")
+                            st.dataframe(
+                                display_all.style.map(
+                                    lambda v: "color:#4ade80;font-weight:700" if v > 0 else "color:#f87171;font-weight:700",
+                                    subset=["Retorno %"]
+                                ).format({"Retorno %": "{:+.2f}%",
+                                          "Precio entrada": "${:,.2f}",
+                                          "Precio salida":  "${:,.2f}"}),
+                                use_container_width=True, height=380
+                            )
+
+                        csv_port = all_trades_df.drop(columns=["_ret"], errors="ignore").to_csv(index=False).encode("utf-8")
+                        st.download_button("📥 Exportar todas las operaciones (CSV)",
+                                           csv_port, "backtest_portfolio.csv", "text/csv")
+            else:
+                st.info("Configurá los parámetros y presioná **▶️ Correr backtest de portfolio** para simular la estrategia en todos los tickers del panel seleccionado.")
+
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 5 — ANÁLISIS FUNDAMENTAL
+    # ─────────────────────────────────────────────────────────────────────
+    with tab5:
+        st.subheader("📑 Análisis Fundamental")
+        st.caption("Datos: yfinance · Cache 24 hs · Cobertura variable según ticker (mejor en Panel Líder)")
+
+        f_mode = st.radio("Vista", ["Ticker individual", "Screener fundamental"],
+                          horizontal=True)
+        st.divider()
+
+        # ══ DESCARGA FUNDAMENTALES ══════════════════════════════════════
+        with st.spinner("⏳ Descargando métricas fundamentales…"):
+            fund_data = fetch_fundamentals(tuple(tickers_list))
+
+        # ══ TICKER INDIVIDUAL ═══════════════════════════════════════════
+        if f_mode == "Ticker individual":
+            f_ticker = st.selectbox(
+                "Seleccioná un ticker",
+                list(detail_store.keys()),
+                format_func=lambda x: f"{x}  —  {TICKERS.get(x+'.BA', ('?','?','?'))[0]}",
+                key="f_ticker_sel"
+            )
+
+            if f_ticker:
+                f = fund_data.get(f_ticker + ".BA", {})
+                tech_score = detail_store[f_ticker]["score"]
+                tech_rec   = detail_store[f_ticker]["rec"]
+                fund_score, fund_signals = score_fundamentals(f)
+                fund_rec_label, fund_rec_color = rec_fundamental(fund_score)
+                combined   = tech_score + fund_score
+                comb_label = "COMPRA FUERTE" if combined >= 10 else                              "COMPRA"        if combined >= 5  else                              "NEUTRAL"       if combined >= -2 else                              "VENTA"         if combined >= -6 else "VENTA FUERTE"
+
+                nombre, sector, panel = TICKERS.get(f_ticker + ".BA", ("?","?","?"))
+                st.markdown(
+                    f"### {f_ticker} &nbsp;"
+                    f"<small style='color:#94a3b8'>{nombre} · {sector} · Panel {panel}</small>",
+                    unsafe_allow_html=True
+                )
+
+                # ── Scores: técnico / fundamental / combinado ──
+                sc1, sc2, sc3 = st.columns(3)
+                with sc1:
+                    st.markdown(f"""
+                    <div style='background:#1a1d27;border:1px solid #2d3148;border-radius:10px;padding:16px;text-align:center'>
+                        <div style='color:#94a3b8;font-size:12px;margin-bottom:6px'>📊 SCORE TÉCNICO</div>
+                        <div style='font-size:2em;font-weight:700;color:{score_color(tech_score)}'>{tech_score:+d}</div>
+                        <div style='font-size:13px;color:{score_color(tech_score)};margin-top:4px'>{tech_rec}</div>
+                    </div>""", unsafe_allow_html=True)
+                with sc2:
+                    st.markdown(f"""
+                    <div style='background:#1a1d27;border:1px solid #2d3148;border-radius:10px;padding:16px;text-align:center'>
+                        <div style='color:#94a3b8;font-size:12px;margin-bottom:6px'>📑 SCORE FUNDAMENTAL</div>
+                        <div style='font-size:2em;font-weight:700;color:{fund_rec_color}'>{fund_score:+d}</div>
+                        <div style='font-size:13px;color:{fund_rec_color};margin-top:4px'>{fund_rec_label}</div>
+                    </div>""", unsafe_allow_html=True)
+                with sc3:
+                    comb_color = score_color(combined // 2)
+                    st.markdown(f"""
+                    <div style='background:#1a1d27;border:2px solid {comb_color};border-radius:10px;padding:16px;text-align:center'>
+                        <div style='color:#94a3b8;font-size:12px;margin-bottom:6px'>⚡ SCORE COMBINADO</div>
+                        <div style='font-size:2em;font-weight:700;color:{comb_color}'>{combined:+d}</div>
+                        <div style='font-size:13px;color:{comb_color};margin-top:4px'>{comb_label}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # ── Radar + métricas lado a lado ──
+                col_radar, col_mets = st.columns([1, 1])
+
+                with col_radar:
+                    st.plotly_chart(build_fundamental_radar(f, f_ticker),
+                                    use_container_width=True)
+
+                with col_mets:
+                    # Tabla de métricas con 4 secciones
+                    sections = [
+                        ("📐 Valuación", [
+                            ("P/E (trailing)",  fmt(f.get("pe"),        ".1f", "x")),
+                            ("P/B",             fmt(f.get("pb"),        ".2f", "x")),
+                            ("EV/EBITDA",       fmt(f.get("ev_ebitda"), ".1f", "x")),
+                        ]),
+                        ("💰 Rentabilidad", [
+                            ("ROE",         fmt(f.get("roe"),         ".1%") if f.get("roe") is not None else "N/D"),
+                            ("ROA",         fmt(f.get("roa"),         ".1%") if f.get("roa") is not None else "N/D"),
+                            ("Margen Neto", fmt(f.get("margen_neto"), ".1%") if f.get("margen_neto") is not None else "N/D"),
+                        ]),
+                        ("🏦 Deuda y Liquidez", [
+                            ("Debt/Equity",   fmt(f.get("debt_eq"),  ".2f", "x") if f.get("debt_eq") is not None else "N/D"),
+                            ("Current Ratio", fmt(f.get("current"),  ".2f", "x")),
+                        ]),
+                        ("💵 Dividendos", [
+                            ("Dividend Yield", fmt(f.get("div_yield"), ".2%") if f.get("div_yield") is not None else "N/D"),
+                            ("Payout Ratio",   fmt(f.get("payout"),   ".1%") if f.get("payout")    is not None else "N/D"),
+                        ]),
+                    ]
+
+                    for title, items in sections:
+                        st.markdown(f"**{title}**")
+                        rows_html = "".join(
+                            f"<tr><td style='padding:4px 8px;color:#94a3b8;font-size:13px'>{k}</td>"
+                            f"<td style='padding:4px 8px;font-weight:600;font-size:13px;"
+                            f"color:{'#cbd5e1' if v != 'N/D' else '#4b5563'}'>{v}</td></tr>"
+                            for k, v in items
+                        )
+                        st.markdown(
+                            f"<table style='width:100%;border-collapse:collapse'>{rows_html}</table>",
+                            unsafe_allow_html=True
+                        )
+                        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+                st.divider()
+
+                # ── Señales fundamentales ──
+                with st.expander("📌 Señales fundamentales detectadas", expanded=True):
+                    if fund_signals:
+                        col_a, col_b = st.columns(2)
+                        for i, sig in enumerate(fund_signals):
+                            (col_a if i % 2 == 0 else col_b).markdown(f"- {sig}")
+                    else:
+                        st.info("Sin datos fundamentales suficientes para este ticker.")
+
+        # ══ SCREENER FUNDAMENTAL ════════════════════════════════════════
+        else:
+            st.markdown("##### Ranking por score fundamental — todos los tickers analizados")
+
+            fund_rows = []
+            for sym in detail_store.keys():
+                f = fund_data.get(sym + ".BA", {})
+                nombre, sector, panel = TICKERS.get(sym + ".BA", ("?","?","?"))
+                tech_sc  = detail_store[sym]["score"]
+                fund_sc, _ = score_fundamentals(f)
+                combined_sc = tech_sc + fund_sc
+                f_label, f_color = rec_fundamental(fund_sc)
+
+                fund_rows.append({
+                    "Ticker":       sym,
+                    "Nombre":       nombre,
+                    "Panel":        panel,
+                    "Sector":       sector,
+                    "Score Téc.":   tech_sc,
+                    "Score Fund.":  fund_sc,
+                    "Score Comb.":  combined_sc,
+                    "Señal Fund.":  f_label,
+                    "P/E":          fmt(f.get("pe"),        ".1f"),
+                    "P/B":          fmt(f.get("pb"),        ".2f"),
+                    "EV/EBITDA":    fmt(f.get("ev_ebitda"), ".1f"),
+                    "ROE":          fmt(f.get("roe"),        ".1%") if f.get("roe")  is not None else "N/D",
+                    "ROA":          fmt(f.get("roa"),        ".1%") if f.get("roa")  is not None else "N/D",
+                    "Marg. Neto":   fmt(f.get("margen_neto"),".1%") if f.get("margen_neto") is not None else "N/D",
+                    "Debt/Eq.":     fmt(f.get("debt_eq"),   ".2f") if f.get("debt_eq") is not None else "N/D",
+                    "Curr. Ratio":  fmt(f.get("current"),   ".2f"),
+                    "Div. Yield":   fmt(f.get("div_yield"), ".2%") if f.get("div_yield") is not None else "N/D",
+                })
+
+            if not fund_rows:
+                st.info("Sin datos para mostrar.")
+            else:
+                fund_df = pd.DataFrame(fund_rows).sort_values("Score Comb.", ascending=False).reset_index(drop=True)
+
+                # Filtro rápido
+                ff1, ff2 = st.columns([2, 2])
+                with ff1:
+                    sort_fund = st.selectbox("Ordenar por",
+                        ["Score Comb.", "Score Téc.", "Score Fund."], key="sort_fund")
+                with ff2:
+                    panel_fund = st.multiselect("Panel", ["Líder", "General"],
+                        default=["Líder", "General"], key="panel_fund")
+
+                fund_df = fund_df[fund_df["Panel"].isin(panel_fund)] if panel_fund else fund_df
+                fund_df = fund_df.sort_values(sort_fund, ascending=False).reset_index(drop=True)
+
+                FUND_COLORS = {
+                    "MUY SÓLIDO": ("#00d4aa", "#0d2b24"),
+                    "SÓLIDO":     ("#4ade80", "#0f2318"),
+                    "NEUTRO":     ("#fbbf24", "#2b2410"),
+                    "DÉBIL":      ("#f87171", "#2b1010"),
+                    "MUY DÉBIL":  ("#ff4b6b", "#330a14"),
+                }
+
+                def _color_fund_señal(val):
+                    c, bg = FUND_COLORS.get(val, ("#aaa", "#222"))
+                    return f"background-color:{bg};color:{c};font-weight:700"
+
+                def _color_comb(val):
+                    return f"color:{score_color(val // 2)};font-weight:700"
+
+                display_fund_cols = ["Ticker","Nombre","Panel","Score Téc.","Score Fund.",
+                                     "Score Comb.","Señal Fund.","P/E","P/B","ROE","ROA",
+                                     "Marg. Neto","Debt/Eq.","Div. Yield"]
+
+                styled_fund = (
+                    fund_df[display_fund_cols].style
+                    .map(_color_fund_señal, subset=["Señal Fund."])
+                    .map(_color_comb,       subset=["Score Comb."])
+                    .map(_color_score,      subset=["Score Téc."])
+                    .map(lambda v: "color:#fbbf24;font-weight:600" if v == "N/D" else "",
+                         subset=["P/E","P/B","ROE","ROA","Marg. Neto","Debt/Eq.","Div. Yield"])
+                    .format({"Score Téc.":  "{:+d}",
+                             "Score Fund.": "{:+d}",
+                             "Score Comb.": "{:+d}"})
+                )
+
+                st.dataframe(styled_fund, use_container_width=True, height=500)
+
+                csv_fund = fund_df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Exportar screener fundamental (CSV)",
+                                   csv_fund, "screener_fundamental.csv", "text/csv")
+
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 6 — CEDEARs
+    # ─────────────────────────────────────────────────────────────────────
+    with tab6:
+        st.subheader("💱 Tracker de CEDEARs — Dólar Implícito")
+        st.caption("Compara el CCL implícito de cada CEDEAR vs el CCL de referencia del panel macro.")
+
+        macro_now = fetch_macro()
+        ccl_ref   = macro_now.get("ccl") or 0
+        cedear_df = fetch_cedears(ccl_ref)
+
+        if cedear_df.empty:
+            st.warning("No se pudieron obtener datos de CEDEARs. Revisá la conexión.")
+        else:
+            # ── Métricas resumen ──
+            n_desc   = (cedear_df["Prima/Desc %"] < -2).sum()
+            n_prem   = (cedear_df["Prima/Desc %"] >  2).sum()
+            n_par    = len(cedear_df) - n_desc - n_prem
+            avg_impl = cedear_df["CCL Implícito"].mean()
+
+            cm1, cm2, cm3, cm4, cm5 = st.columns(5)
+            cm1.metric("CCL Referencia",   f"${ccl_ref:,.0f}" if ccl_ref else "—")
+            cm2.metric("CCL Implícito prom.", f"${avg_impl:,.0f}")
+            cm3.metric("🟢 Con descuento (< −2%)", n_desc,
+                       help="CEDEARs cuyo CCL implícito está por debajo del CCL real — potencialmente baratos en ARS")
+            cm4.metric("🟡 A la par (±2%)",        n_par)
+            cm5.metric("🔴 Con prima (> +2%)",     n_prem,
+                       help="CEDEARs cuyo CCL implícito supera el CCL real — caros en ARS")
+
+            st.divider()
+
+            # ── Filtro sector ──
+            sectores_c = sorted(cedear_df["Sector"].unique().tolist())
+            sel_sect   = st.multiselect("Sector", sectores_c, default=sectores_c, key="ced_sect")
+            cedear_filt = cedear_df[cedear_df["Sector"].isin(sel_sect)] if sel_sect else cedear_df
+
+            # ── Color prima/descuento ──
+            def _color_prima(val):
+                if val < -2:   return "color:#4ade80;font-weight:700"
+                elif val > 2:  return "color:#f87171;font-weight:700"
+                return "color:#fbbf24;font-weight:700"
+
+            display_ced = ["Ticker","Nombre","Sector","Precio ARS $","Precio USD $",
+                           "Ratio","CCL Implícito","CCL Referencia","Prima/Desc %"]
+            styled_ced = (
+                cedear_filt[display_ced].style
+                .map(_color_prima, subset=["Prima/Desc %"])
+                .format({
+                    "Precio ARS $":   "${:,.2f}",
+                    "Precio USD $":   "${:,.2f}",
+                    "CCL Implícito":  "${:,.2f}",
+                    "CCL Referencia": "${:,.2f}",
+                    "Prima/Desc %":   "{:+.2f}%",
+                })
+            )
+            st.dataframe(styled_ced, use_container_width=True, height=520)
+
+            # ── Gráfico de barras horizontal ──
+            st.markdown("#### Prima / Descuento vs CCL de referencia")
+            sorted_c = cedear_filt.sort_values("Prima/Desc %")
+            bar_cols  = ["#4ade80" if v < -2 else "#f87171" if v > 2 else "#fbbf24"
+                         for v in sorted_c["Prima/Desc %"]]
+            fig_ced = go.Figure(go.Bar(
+                x=sorted_c["Prima/Desc %"],
+                y=sorted_c["Ticker"],
+                orientation="h",
+                marker_color=bar_cols,
+                text=[f"{v:+.1f}%" for v in sorted_c["Prima/Desc %"]],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Prima/Desc: %{x:+.2f}%<extra></extra>",
+            ))
+            fig_ced.add_vline(x=0,  line_color="rgba(255,255,255,0.3)", line_width=1)
+            fig_ced.add_vline(x=2,  line_dash="dot", line_color="#f87171", opacity=0.5)
+            fig_ced.add_vline(x=-2, line_dash="dot", line_color="#4ade80", opacity=0.5)
+            fig_ced.update_layout(
+                template="plotly_dark", height=max(400, len(sorted_c) * 26),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+                font=dict(color="#cbd5e1", size=11),
+                margin=dict(l=10, r=60, t=20, b=20),
+                xaxis=dict(ticksuffix="%", gridcolor="rgba(255,255,255,0.04)"),
+                yaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+            )
+            st.plotly_chart(fig_ced, use_container_width=True)
+
+            csv_ced = cedear_filt[display_ced].to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Exportar CEDEARs (CSV)", csv_ced,
+                               "cedears_ccl.csv", "text/csv")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 7 — CORRELACIÓN
+    # ─────────────────────────────────────────────────────────────────────
+    with tab7:
+        st.subheader("🔗 Correlación entre papeles")
+        st.caption("Correlación de retornos diarios. Verde = alta correlación positiva · Rojo = correlación negativa · Centro = sin relación.")
+
+        col_opt1, col_opt2 = st.columns([2, 2])
+        with col_opt1:
+            corr_panel = st.multiselect(
+                "Panel a incluir", ["Líder", "General"],
+                default=["Líder"], key="corr_panel"
+            )
+        with col_opt2:
+            corr_min   = st.slider("Mínimo de ruedas con datos", 20, 60, 30, 5, key="corr_min")
+
+        # Filtrar data por panel
+        corr_data = {
+            k: v for k, v in data.items()
+            if TICKERS.get(k, ("","","?"))[2] in corr_panel
+        }
+
+        if len(corr_data) < 2:
+            st.info("Necesitás al menos 2 tickers para calcular correlación. Ampliá el panel.")
+        else:
+            with st.spinner("Calculando matriz de correlación…"):
+                fig_corr = build_correlation_heatmap(corr_data, min_periods=corr_min)
+
+            if not fig_corr.data:
+                st.warning("Sin suficientes datos comunes. Reducí el mínimo de ruedas.")
+            else:
+                st.plotly_chart(fig_corr, use_container_width=True)
+
+                # ── Pares más correlacionados / menos correlacionados ──
+                ret_map = {}
+                for ticker, df_c in corr_data.items():
+                    sym = ticker.replace(".BA", "")
+                    try:
+                        r = df_c["Close"].pct_change().dropna()
+                        if len(r) >= corr_min:
+                            ret_map[sym] = r
+                    except Exception:
+                        continue
+
+                if len(ret_map) >= 2:
+                    ret_df2  = pd.DataFrame(ret_map).dropna(how="all")
+                    corr_m   = ret_df2.corr()
+                    pairs = []
+                    cols_c = corr_m.columns.tolist()
+                    for i in range(len(cols_c)):
+                        for j in range(i+1, len(cols_c)):
+                            pairs.append({
+                                "Par":          f"{cols_c[i]} / {cols_c[j]}",
+                                "Correlación":  round(corr_m.iloc[i, j], 3),
+                            })
+                    pairs_df = pd.DataFrame(pairs).sort_values("Correlación", ascending=False)
+
+                    cp1, cp2 = st.columns(2)
+                    with cp1:
+                        st.markdown("##### 🔴 Pares más correlacionados (mayor riesgo de concentración)")
+                        top_corr = pairs_df.head(8).style.format({"Correlación": "{:.3f}"})
+                        st.dataframe(top_corr, use_container_width=True, hide_index=True)
+                    with cp2:
+                        st.markdown("##### 🟢 Pares menos correlacionados (mayor diversificación)")
+                        low_corr = pairs_df.tail(8).style.format({"Correlación": "{:.3f}"})
+                        st.dataframe(low_corr, use_container_width=True, hide_index=True)
+
+                    csv_corr = pairs_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Exportar pares de correlación (CSV)",
+                                       csv_corr, "correlacion.csv", "text/csv")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 8 — HISTORIAL DE SEÑALES
+    # ─────────────────────────────────────────────────────────────────────
+    with tab8:
+        st.subheader("📜 Historial de Señales")
+        st.caption("Registro automático de cada estado del screener durante la sesión. Se guarda en memoria; exportá el CSV para conservarlo entre sesiones.")
+
+        hist = st.session_state.get(HIST_KEY, [])
+
+        if not hist:
+            st.info("El historial se genera automáticamente al cargar la app. Volvé a esta tab después de algunas actualizaciones.")
+        else:
+            hist_df = pd.DataFrame(hist)
+
+            # ── Métricas ──
+            n_snaps  = hist_df["Timestamp"].nunique()
+            n_ticks  = hist_df["Ticker"].nunique()
+            last_ts  = hist_df["Timestamp"].max()
+
+            hm1, hm2, hm3 = st.columns(3)
+            hm1.metric("📸 Snapshots guardados", n_snaps)
+            hm2.metric("📊 Tickers registrados", n_ticks)
+            hm3.metric("🕐 Último registro",     last_ts)
+
+            st.divider()
+
+            # ── Filtros ──
+            hf1, hf2 = st.columns([2, 2])
+            with hf1:
+                hist_ticker = st.selectbox("Ver evolución de ticker",
+                    ["— Todos —"] + sorted(hist_df["Ticker"].unique().tolist()),
+                    key="hist_ticker_sel")
+            with hf2:
+                hist_señal = st.multiselect("Filtrar por señal",
+                    hist_df["Señal"].unique().tolist(),
+                    default=list(hist_df["Señal"].unique()),
+                    key="hist_señal_sel")
+
+            hist_filt = hist_df.copy()
+            if hist_señal:
+                hist_filt = hist_filt[hist_filt["Señal"].isin(hist_señal)]
+
+            # ── Gráfico de score histórico por ticker ──
+            if hist_ticker != "— Todos —" and hist_ticker in hist_df["Ticker"].values:
+                st.plotly_chart(build_history_chart(hist_df, hist_ticker),
+                                use_container_width=True)
+                hist_filt = hist_filt[hist_filt["Ticker"] == hist_ticker]
+
+            # ── Tabla ──
+            def _color_hist_señal(val):
+                c, bg = REC_COLORS.get(val, ("#aaa","#222"))
+                return f"background-color:{bg};color:{c};font-weight:700"
+
+            styled_hist = (
+                hist_filt.style
+                .map(_color_hist_señal, subset=["Señal"])
+                .map(_color_score,      subset=["Score"])
+                .map(lambda v: "color:#4ade80" if v >= 0 else "color:#f87171",
+                     subset=["Var %"])
+                .format({
+                    "Score":    "{:+d}",
+                    "Precio $": "${:,.2f}",
+                    "Var %":    "{:+.2f}%",
+                    "RSI":      "{:.1f}",
+                    "RVOL":     "{:.2f}x",
+                })
+            )
+            st.dataframe(styled_hist, use_container_width=True, height=460)
+
+            # ── Heatmap de señales por ticker a lo largo del tiempo ──
+            if n_snaps > 1 and n_ticks > 1:
+                st.markdown("#### Evolución de scores por ticker")
+                pivot = hist_df.pivot_table(
+                    index="Ticker", columns="Timestamp",
+                    values="Score", aggfunc="last"
+                ).fillna(0)
+                fig_heat = go.Figure(go.Heatmap(
+                    z=pivot.values, x=pivot.columns.tolist(),
+                    y=pivot.index.tolist(),
+                    colorscale=[
+                        [0.0, "#ff4b6b"],[0.3, "#f87171"],
+                        [0.5, "#1e2235"],[0.7, "#4ade80"],[1.0, "#00d4aa"]
+                    ],
+                    zmin=-8, zmax=8,
+                    text=pivot.values.astype(int).astype(str),
+                    texttemplate="%{text}",
+                    textfont=dict(size=9),
+                    hovertemplate="<b>%{y}</b><br>%{x}<br>Score: %{z}<extra></extra>",
+                ))
+                fig_heat.update_layout(
+                    template="plotly_dark",
+                    height=max(300, len(pivot) * 22),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+                    font=dict(color="#cbd5e1", size=10),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            # ── Export ──
+            csv_hist = hist_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Exportar historial completo (CSV)",
+                csv_hist,
+                f"historial_señales_{datetime.now(timezone(timedelta(hours=-3))).strftime('%Y%m%d_%H%M')}.csv",
+                "text/csv",
+                use_container_width=False,
+            )
+
+            if st.button("🗑️ Limpiar historial de esta sesión", type="secondary"):
+                st.session_state[HIST_KEY] = []
+                st.rerun()
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
