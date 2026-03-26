@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -530,7 +530,7 @@ def main():
     with col_t:
         st.markdown("## 📈 BCBA Swing Analyzer")
         st.caption(
-            f"Datos: Yahoo Finance · Actualización: {datetime.now().strftime('%d/%m/%Y %H:%M')} hs"
+            f"Datos: Yahoo Finance · Actualización: {datetime.now(timezone(timedelta(hours=-3))).strftime('%d/%m/%Y %H:%M')} hs"
         )
     with col_ts:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -684,7 +684,7 @@ def main():
         st.download_button(
             "⬇️ Exportar CSV",
             csv_data,
-            f"bcba_screening_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            f"bcba_screening_{datetime.now(timezone(timedelta(hours=-3))).strftime('%Y%m%d_%H%M')}.csv",
             "text/csv",
         )
 
