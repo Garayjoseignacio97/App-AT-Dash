@@ -433,8 +433,8 @@ def build_chart(df: pd.DataFrame, ticker: str, metrics: dict) -> go.Figure:
     fig = make_subplots(
         rows=4, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.025,
-        row_heights=[0.50, 0.18, 0.17, 0.15],
+        vertical_spacing=0.04,
+        row_heights=[0.48, 0.19, 0.19, 0.14],
         subplot_titles=[
             f"{ticker} — Precio + Bollinger + SMAs",
             "MACD (12/26/9)",
@@ -494,14 +494,17 @@ def build_chart(df: pd.DataFrame, ticker: str, metrics: dict) -> go.Figure:
     # ── Layout ──
     fig.update_layout(
         template="plotly_dark",
-        height=820,
+        height=960,
         xaxis_rangeslider_visible=False,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#0e1117",
         font=dict(color="#cbd5e1", size=11),
-        margin=dict(l=0, r=0, t=28, b=0),
+        margin=dict(l=0, r=10, t=45, b=10),
         hovermode="x unified",
     )
+    # Tamaño de los títulos de subpaneles
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=11, color="#94a3b8")
     fig.update_yaxes(gridcolor="rgba(255,255,255,0.04)", zeroline=False)
     fig.update_xaxes(
         gridcolor="rgba(255,255,255,0.04)",
@@ -636,6 +639,16 @@ def main():
 
         st.divider()
 
+        # ── Filtro por señal ──
+        todas_señales = ["COMPRA FUERTE", "COMPRA", "NEUTRAL", "VENTA", "VENTA FUERTE"]
+        señal_filter = st.multiselect(
+            "Filtrar por señal",
+            todas_señales,
+            default=todas_señales,
+            help="Seleccioná una o más señales para filtrar el ranking"
+        )
+        filtered_df = results_df[results_df["Señal"].isin(señal_filter)] if señal_filter else results_df
+
         # ── Tabla con colores ──
         display_cols = ["Ticker","Nombre","Panel","Sector","Precio $","Var %","Score","Señal","RSI","RVOL","N° Señales"]
 
@@ -650,7 +663,7 @@ def main():
             return "color:#4ade80" if val >= 0 else "color:#f87171"
 
         styled = (
-            results_df[display_cols]
+            filtered_df[display_cols]
             .style
             .map(_color_señal, subset=["Señal"])
             .map(_color_score, subset=["Score"])
@@ -667,7 +680,7 @@ def main():
         st.dataframe(styled, use_container_width=True, height=520)
 
         # ── Export CSV ──
-        csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+        csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "📥 Exportar ranking completo (CSV)",
             csv_bytes, "bcba_ranking.csv", "text/csv",
