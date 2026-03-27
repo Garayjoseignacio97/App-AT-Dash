@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -1371,6 +1372,186 @@ def build_history_chart(hist_df: pd.DataFrame, ticker: str) -> go.Figure:
     return fig
 
 
+# ─── COMPARADOR DE PAPELES ───────────────────────────────────────────────────
+
+def build_comparison_chart(
+    data: dict[str, pd.DataFrame],
+    tickers: list[str],
+    merval_df: pd.DataFrame | None = None,
+) -> go.Figure:
+    """Retornos normalizados (base 100) de múltiples tickers + Merval opcional."""
+    fig = go.Figure()
+    COLORS = ["#00d4aa", "#a78bfa", "#fb923c", "#f43f5e", "#38bdf8"]
+
+    for i, ticker in enumerate(tickers):
+        sym = ticker if ticker.endswith(".BA") else ticker + ".BA"
+        df  = data.get(sym)
+        if df is None or len(df) < 2:
+            continue
+        close   = df["Close"].dropna()
+        normed  = close / float(close.iloc[0]) * 100
+        nombre  = TICKERS.get(sym, (ticker,"",""))[0]
+        color   = COLORS[i % len(COLORS)]
+        var_tot = round(float(normed.iloc[-1]) - 100, 2)
+        fig.add_trace(go.Scatter(
+            x=normed.index, y=normed.values,
+            name=f"{ticker} ({var_tot:+.1f}%)",
+            line=dict(color=color, width=2),
+            hovertemplate=f"<b>{ticker}</b><br>%{{x}}<br>Retorno: %{{y:.1f}}<extra></extra>",
+        ))
+
+    if merval_df is not None and len(merval_df) > 1:
+        close_m = merval_df["Close"].dropna()
+        normed_m = close_m / float(close_m.iloc[0]) * 100
+        var_m   = round(float(normed_m.iloc[-1]) - 100, 2)
+        fig.add_trace(go.Scatter(
+            x=normed_m.index, y=normed_m.values,
+            name=f"Merval ({var_m:+.1f}%)",
+            line=dict(color="#94a3b8", width=1.5, dash="dot"),
+            hovertemplate="<b>Merval</b><br>%{x}<br>Retorno: %{y:.1f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=100, line_color="rgba(255,255,255,0.15)", line_width=1)
+    fig.update_layout(
+        template="plotly_dark",
+        height=420,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, font=dict(size=11)),
+        yaxis=dict(ticksuffix="", title="Base 100",
+                   gridcolor="rgba(255,255,255,0.04)"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)",
+                   rangebreaks=[dict(bounds=["sat", "mon"])]),
+    )
+    return fig
+
+
+def build_drawdown_chart(
+    data: dict[str, pd.DataFrame],
+    tickers: list[str],
+) -> go.Figure:
+    """Drawdown desde máximo para cada ticker seleccionado."""
+    fig = go.Figure()
+    COLORS = ["#00d4aa", "#a78bfa", "#fb923c", "#f43f5e", "#38bdf8"]
+
+    for i, ticker in enumerate(tickers):
+        sym  = ticker if ticker.endswith(".BA") else ticker + ".BA"
+        df   = data.get(sym)
+        if df is None or len(df) < 2:
+            continue
+        close    = df["Close"].dropna()
+        roll_max = close.cummax()
+        dd       = (close - roll_max) / roll_max * 100
+        color    = COLORS[i % len(COLORS)]
+        fig.add_trace(go.Scatter(
+            x=dd.index, y=dd.values,
+            name=ticker,
+            line=dict(color=color, width=1.5),
+            fill="tozeroy",
+            fillcolor=color.replace("#", "rgba(").rstrip(")") + ",0.08)" if "#" in color else color,
+            hovertemplate=f"<b>{ticker}</b><br>%{{x}}<br>DD: %{{y:.1f}}%<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
+    fig.update_layout(
+        template="plotly_dark",
+        height=260,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.08, font=dict(size=11)),
+        yaxis=dict(ticksuffix="%", title="Drawdown",
+                   gridcolor="rgba(255,255,255,0.04)"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)",
+                   rangebreaks=[dict(bounds=["sat", "mon"])]),
+    )
+    return fig
+
+
+# ─── WATCHLIST PERSISTENTE ───────────────────────────────────────────────────
+
+WATCHLIST_FILE = "watchlist.json"
+
+
+def load_watchlist() -> list[str]:
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            import json
+            return json.load(open(WATCHLIST_FILE, "r"))
+    except Exception:
+        pass
+    return []
+
+
+def save_watchlist(tickers: list[str]) -> None:
+    try:
+        import json
+        json.dump(tickers, open(WATCHLIST_FILE, "w"), indent=2)
+    except Exception:
+        pass
+
+
+# ─── SIMULADOR DE POSICIÓN ───────────────────────────────────────────────────
+
+def calc_position(
+    capital: float,
+    risk_pct: float,
+    price: float,
+    atr: float,
+    atr_mult: float = 2.0,
+    commission_pct: float = 0.006,
+) -> dict:
+    """
+    Calcula sizing óptimo de posición basado en riesgo fijo por operación.
+    """
+    risk_amount  = capital * (risk_pct / 100)
+    stop_dist    = atr * atr_mult
+    stop_price   = price - stop_dist
+    shares       = max(1, int(risk_amount / stop_dist))
+
+    gross_invest = shares * price
+    commission   = gross_invest * commission_pct
+    net_invest   = gross_invest + commission
+    pct_capital  = net_invest / capital * 100
+
+    target_1     = price + stop_dist           # 1:1
+    target_2     = price + stop_dist * 2       # 1:2
+    target_3     = price + stop_dist * 3       # 1:3
+
+    gain_t1      = (target_1 - price) * shares - commission
+    gain_t2      = (target_2 - price) * shares - commission
+    gain_t3      = (target_3 - price) * shares - commission
+    loss_sl      = (price - stop_price) * shares + commission
+
+    return {
+        "shares":       shares,
+        "price":        round(price, 2),
+        "stop":         round(stop_price, 2),
+        "stop_dist":    round(stop_dist, 2),
+        "stop_dist_pct":round(stop_dist / price * 100, 2),
+        "target_1":     round(target_1, 2),
+        "target_2":     round(target_2, 2),
+        "target_3":     round(target_3, 2),
+        "gross_invest": round(gross_invest, 2),
+        "commission":   round(commission, 2),
+        "net_invest":   round(net_invest, 2),
+        "pct_capital":  round(pct_capital, 2),
+        "risk_amount":  round(risk_amount, 2),
+        "gain_t1":      round(gain_t1, 2),
+        "gain_t2":      round(gain_t2, 2),
+        "gain_t3":      round(gain_t3, 2),
+        "loss_sl":      round(loss_sl, 2),
+        "rr_1":         round(gain_t1 / loss_sl, 2) if loss_sl > 0 else 0,
+        "rr_2":         round(gain_t2 / loss_sl, 2) if loss_sl > 0 else 0,
+        "rr_3":         round(gain_t3 / loss_sl, 2) if loss_sl > 0 else 0,
+    }
+
+
 # ─── APP PRINCIPAL ────────────────────────────────────────────────────────────
 
 def main():
@@ -1482,7 +1663,7 @@ def main():
 
     # ══ TABS ═══════════════════════════════════════════════════════════════
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 Ranking & Screener", "📈 Análisis Individual", "🔔 Alertas", "🧪 Backtester", "📑 Análisis Fundamental", "💱 CEDEARs", "🔗 Correlación", "📜 Historial"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Ranking & Screener", "📈 Análisis Individual", "🔔 Alertas", "🧪 Backtester", "📑 Análisis Fundamental", "💱 CEDEARs", "🔗 Correlación", "📜 Historial", "⚖️ Comparador", "📋 Watchlist", "🎯 Sizing"])
 
     # ─────────────────────────────────────────────────────────────────────
     # TAB 1 — RANKING
@@ -2389,6 +2570,366 @@ def main():
             if st.button("🗑️ Limpiar historial de esta sesión", type="secondary"):
                 st.session_state[HIST_KEY] = []
                 st.rerun()
+
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 9 — COMPARADOR
+    # ─────────────────────────────────────────────────────────────────────
+    with tab9:
+        st.subheader("⚖️ Comparador de Papeles")
+        st.caption("Retornos normalizados (base 100) — compará performance relativa entre tickers y vs el Merval.")
+
+        all_syms   = sorted([t.replace(".BA","") for t in data.keys()])
+        default_sel = all_syms[:3] if len(all_syms) >= 3 else all_syms
+
+        cp1, cp2 = st.columns([3, 1])
+        with cp1:
+            comp_tickers = st.multiselect(
+                "Seleccioná hasta 5 tickers para comparar",
+                all_syms,
+                default=default_sel,
+                max_selections=5,
+                key="comp_tickers",
+            )
+        with cp2:
+            show_merval = st.checkbox("Incluir Merval", value=True, key="comp_merval")
+            comp_period = st.selectbox("Período", ["3mo","6mo","1y","2y"], index=1,
+                                       format_func=lambda x: {"3mo":"3m","6mo":"6m","1y":"1a","2y":"2a"}[x],
+                                       key="comp_period")
+
+        if not comp_tickers:
+            st.info("Seleccioná al menos un ticker.")
+        else:
+            # Descargar Merval si se pidió
+            merval_df = None
+            if show_merval:
+                try:
+                    raw_m = yf.download("^MERV", period=comp_period,
+                                        auto_adjust=True, progress=False)
+                    if not raw_m.empty:
+                        merval_df = raw_m
+                except Exception:
+                    pass
+
+            # Re-fetch si el período difiere del cargado en sidebar
+            if comp_period != period:
+                with st.spinner("Descargando datos del período seleccionado…"):
+                    extra_tickers = [t+".BA" for t in comp_tickers]
+                    raw_comp = yf.download(extra_tickers, period=comp_period,
+                                           auto_adjust=True, progress=False,
+                                           group_by="ticker", threads=True)
+                    comp_data = {}
+                    for sym in comp_tickers:
+                        ticker_ba = sym + ".BA"
+                        try:
+                            if len(extra_tickers) == 1:
+                                comp_data[ticker_ba] = raw_comp.dropna(how="all")
+                            else:
+                                comp_data[ticker_ba] = raw_comp[ticker_ba].dropna(how="all")
+                        except Exception:
+                            pass
+            else:
+                comp_data = data
+
+            # ── Gráfico retornos normalizados ──
+            fig_comp = build_comparison_chart(comp_data, comp_tickers, merval_df)
+            st.plotly_chart(fig_comp, use_container_width=True)
+
+            # ── Drawdown ──
+            st.markdown("#### Drawdown desde máximo")
+            fig_dd = build_drawdown_chart(comp_data, comp_tickers)
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+            # ── Tabla comparativa de métricas ──
+            st.markdown("#### Métricas comparativas")
+            comp_rows = []
+            for sym in comp_tickers:
+                ticker_ba = sym + ".BA"
+                df_c = comp_data.get(ticker_ba)
+                if df_c is None or len(df_c) < 5:
+                    continue
+                close_c = df_c["Close"].dropna()
+                roll_mx = close_c.cummax()
+                dd_s    = (close_c - roll_mx) / roll_mx * 100
+                daily_r = close_c.pct_change().dropna()
+                sharpe  = round(daily_r.mean() / daily_r.std() * (252**0.5), 2) if daily_r.std() > 0 else 0
+                nombre, sector, panel = TICKERS.get(ticker_ba, (sym,"—","—"))
+                comp_rows.append({
+                    "Ticker":       sym,
+                    "Panel":        panel,
+                    "Sector":       sector,
+                    "Retorno %":    round(float(close_c.iloc[-1]/close_c.iloc[0]-1)*100, 2),
+                    "Máx DD %":     round(float(dd_s.min()), 2),
+                    "Sharpe":       sharpe,
+                    "Vol. anual %": round(float(daily_r.std()) * (252**0.5) * 100, 2),
+                    "Precio":       round(float(close_c.iloc[-1]), 2),
+                })
+            if comp_rows:
+                comp_met_df = pd.DataFrame(comp_rows).set_index("Ticker")
+
+                def _cr(v): return "color:#4ade80;font-weight:700" if v>0 else "color:#f87171;font-weight:700"
+                def _dd(v): return "color:#f87171;font-weight:700" if v<-15 else "color:#fbbf24" if v<-5 else "color:#4ade80"
+
+                st.dataframe(
+                    comp_met_df.style
+                    .map(_cr, subset=["Retorno %"])
+                    .map(_dd, subset=["Máx DD %"])
+                    .format({"Retorno %":"{:+.2f}%","Máx DD %":"{:.2f}%",
+                             "Vol. anual %":"{:.2f}%","Precio":"${:,.2f}","Sharpe":"{:.2f}"}),
+                    use_container_width=True,
+                )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 10 — WATCHLIST
+    # ─────────────────────────────────────────────────────────────────────
+    with tab10:
+        st.subheader("📋 Watchlist Personalizada")
+        st.caption("Tu lista de seguimiento persistente. Se guarda en watchlist.json en el repositorio.")
+
+        wl = st.session_state['watchlist']
+        all_syms_wl = sorted([t.replace(".BA","") for t in TICKERS.keys()])
+
+        # ── Agregar ticker ──
+        wa1, wa2 = st.columns([3, 1])
+        with wa1:
+            add_ticker = st.selectbox("Agregar ticker a la watchlist",
+                                      ["— Seleccioná —"] + [s for s in all_syms_wl if s not in wl],
+                                      key="wl_add")
+        with wa2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("➕ Agregar", use_container_width=True) and add_ticker != "— Seleccioná —":
+                if add_ticker not in wl:
+                    wl.append(add_ticker)
+                    save_watchlist(wl)
+                    st.session_state['watchlist'] = wl
+                    st.rerun()
+
+        st.divider()
+
+        if not wl:
+            st.info("Tu watchlist está vacía. Agregá tickers desde el menú de arriba.")
+        else:
+            st.markdown(f"**{len(wl)} tickers en seguimiento**")
+
+            # ── Tabla de watchlist con datos en vivo ──
+            wl_rows = []
+            for sym in wl:
+                ticker_ba = sym + ".BA"
+                df_wl = data.get(ticker_ba)
+                if df_wl is not None and len(df_wl) > 1:
+                    d_info = detail_store.get(sym, {})
+                    price  = float(df_wl["Close"].iloc[-1])
+                    price_p= float(df_wl["Close"].iloc[-2])
+                    var    = (price/price_p-1)*100
+                    nombre, sector, panel = TICKERS.get(ticker_ba,(sym,"—","—"))
+                    wl_rows.append({
+                        "Ticker":    sym,
+                        "Nombre":    nombre,
+                        "Panel":     panel,
+                        "Sector":    sector,
+                        "Precio $":  round(price,2),
+                        "Var %":     round(var,2),
+                        "Score":     d_info.get("score","—"),
+                        "Señal":     d_info.get("rec","—"),
+                        "RSI":       d_info.get("metrics",{}).get("rsi","—"),
+                        "RVOL":      d_info.get("metrics",{}).get("rvol","—"),
+                    })
+                else:
+                    wl_rows.append({"Ticker":sym,"Nombre":"—","Panel":"—","Sector":"—",
+                                    "Precio $":"—","Var %":"—","Score":"—",
+                                    "Señal":"—","RSI":"—","RVOL":"—"})
+
+            if wl_rows:
+                wl_df = pd.DataFrame(wl_rows)
+
+                def _wl_var(v):
+                    try: return "color:#4ade80;font-weight:700" if float(v)>0 else "color:#f87171;font-weight:700"
+                    except: return ""
+                def _wl_señal(v):
+                    c,bg = REC_COLORS.get(v,("#aaa","#222"))
+                    return f"background-color:{bg};color:{c};font-weight:700"
+
+                num_cols = [c for c in ["Precio $","Var %","Score","RSI","RVOL"] if wl_df[c].apply(lambda x: isinstance(x,(int,float))).all()]
+                fmt_dict = {}
+                if "Precio $" in num_cols: fmt_dict["Precio $"] = "${:,.2f}"
+                if "Var %"    in num_cols: fmt_dict["Var %"]    = "{:+.2f}%"
+                if "Score"    in num_cols: fmt_dict["Score"]    = "{:+d}"
+                if "RVOL"     in num_cols: fmt_dict["RVOL"]     = "{:.2f}x"
+
+                styled_wl = wl_df.style
+                if "Señal" in wl_df.columns:
+                    styled_wl = styled_wl.map(_wl_señal, subset=["Señal"])
+                if fmt_dict:
+                    styled_wl = styled_wl.format(fmt_dict, na_rep="—")
+
+                st.dataframe(styled_wl, use_container_width=True, height=400)
+
+            # ── Gestión de watchlist ──
+            st.markdown("#### Gestionar watchlist")
+            wg1, wg2 = st.columns([3,1])
+            with wg1:
+                del_ticker = st.selectbox("Eliminar ticker", ["— Seleccioná —"] + wl, key="wl_del")
+            with wg2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🗑️ Eliminar", use_container_width=True) and del_ticker != "— Seleccioná —":
+                    wl.remove(del_ticker)
+                    save_watchlist(wl)
+                    st.session_state['watchlist'] = wl
+                    st.rerun()
+
+            if st.button("🗑️ Limpiar toda la watchlist", type="secondary"):
+                st.session_state['watchlist'] = []
+                save_watchlist([])
+                st.rerun()
+
+            csv_wl = pd.DataFrame(wl_rows).to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Exportar watchlist (CSV)", csv_wl,
+                               "watchlist.csv", "text/csv")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 11 — SIZING
+    # ─────────────────────────────────────────────────────────────────────
+    with tab11:
+        st.subheader("🎯 Simulador de Posición & Sizing")
+        st.caption("Calculá el tamaño óptimo de cada operación basado en tu capital y riesgo por trade.")
+
+        sz1, sz2 = st.columns([1, 1])
+        with sz1:
+            st.markdown("#### 💼 Parámetros de cuenta")
+            sz_capital    = st.number_input("Capital disponible (ARS $)", min_value=1000,
+                                            value=1_000_000, step=50_000, format="%d")
+            sz_risk_pct   = st.slider("Riesgo máximo por operación (%)", 0.5, 5.0, 1.0, 0.25,
+                                      help="% del capital que estás dispuesto a perder si salta el stop")
+            sz_commission = st.slider("Comisión estimada (%)", 0.0, 1.5, 0.6, 0.1,
+                                      help="Comisión de compra (IOL ~0.6%, otros brokers varían)")
+            sz_atr_mult   = st.slider("Multiplicador ATR para stop", 1.0, 4.0, 2.0, 0.5,
+                                      help="Stop Loss = Precio − (ATR × multiplicador)")
+
+        with sz2:
+            st.markdown("#### 📈 Seleccioná el papel")
+            sz_ticker = st.selectbox(
+                "Ticker",
+                list(detail_store.keys()),
+                format_func=lambda x: f"{x}  —  {TICKERS.get(x+'.BA',('?','?','?'))[0]}",
+                key="sz_ticker",
+            )
+
+            if sz_ticker and sz_ticker in detail_store:
+                d_sz    = detail_store[sz_ticker]
+                price_sz= float(d_sz["df"]["Close"].iloc[-1])
+                atr_sz  = d_sz["metrics"]["atr"]
+                nombre_sz, sector_sz, panel_sz = TICKERS.get(sz_ticker+".BA",("?","?","?"))
+
+                st.markdown(f"""
+                <div style='background:#1a1d27;border:1px solid #2d3148;border-radius:8px;padding:12px;margin-top:8px'>
+                    <div style='color:#94a3b8;font-size:11px'>Datos actuales de {sz_ticker}</div>
+                    <div style='margin-top:6px;display:flex;gap:24px'>
+                        <span><span style='color:#64748b;font-size:12px'>Precio </span>
+                              <span style='color:#e2e8f0;font-weight:700'>${price_sz:,.2f}</span></span>
+                        <span><span style='color:#64748b;font-size:12px'>ATR(14) </span>
+                              <span style='color:#e2e8f0;font-weight:700'>${atr_sz:,.2f}</span></span>
+                        <span><span style='color:#64748b;font-size:12px'>ATR% </span>
+                              <span style='color:#e2e8f0;font-weight:700'>{atr_sz/price_sz*100:.1f}%</span></span>
+                        <span><span style='color:#64748b;font-size:12px'>Señal </span>
+                              <span style='color:#00d4aa;font-weight:700'>{d_sz["rec"]}</span></span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        if sz_ticker and sz_ticker in detail_store:
+            pos = calc_position(
+                capital=sz_capital,
+                risk_pct=sz_risk_pct,
+                price=price_sz,
+                atr=atr_sz,
+                atr_mult=sz_atr_mult,
+                commission_pct=sz_commission/100,
+            )
+
+            # ── Métricas principales ──
+            sm1,sm2,sm3,sm4,sm5,sm6 = st.columns(6)
+            sm1.metric("📦 Acciones a comprar",  f"{pos['shares']:,}")
+            sm2.metric("💰 Capital a invertir",  f"${pos['net_invest']:,.0f}",
+                       f"{pos['pct_capital']:.1f}% del capital")
+            sm3.metric("🛑 Stop Loss",            f"${pos['stop']:,.2f}",
+                       f"-{pos['stop_dist_pct']:.1f}%")
+            sm4.metric("💸 Riesgo máximo",        f"${pos['loss_sl']:,.0f}",
+                       f"{sz_risk_pct}% del capital")
+            sm5.metric("🏦 Comisión estimada",    f"${pos['commission']:,.0f}")
+            sm6.metric("📊 Exposición",           f"{pos['pct_capital']:.1f}%",
+                       help="% del capital total comprometido en esta posición")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Tabla de targets ──
+            st.markdown("#### 🎯 Niveles de salida y ratio Riesgo/Recompensa")
+            rr_data = pd.DataFrame([
+                {"Nivel":"🛑 Stop Loss",       "Precio":f"${pos['stop']:,.2f}",
+                 "Variación":f"-{pos['stop_dist_pct']:.1f}%",
+                 "P&L estimado":f"-${pos['loss_sl']:,.0f}", "R/R":"—"},
+                {"Nivel":"🟡 Entrada",          "Precio":f"${pos['price']:,.2f}",
+                 "Variación":"—","P&L estimado":"—","R/R":"—"},
+                {"Nivel":"🎯 Target 1 (1:1)",   "Precio":f"${pos['target_1']:,.2f}",
+                 "Variación":f"+{pos['stop_dist_pct']:.1f}%",
+                 "P&L estimado":f"+${pos['gain_t1']:,.0f}","R/R":f"{pos['rr_1']:.1f}"},
+                {"Nivel":"🎯 Target 2 (1:2)",   "Precio":f"${pos['target_2']:,.2f}",
+                 "Variación":f"+{pos['stop_dist_pct']*2:.1f}%",
+                 "P&L estimado":f"+${pos['gain_t2']:,.0f}","R/R":f"{pos['rr_2']:.1f}"},
+                {"Nivel":"🚀 Target 3 (1:3)",   "Precio":f"${pos['target_3']:,.2f}",
+                 "Variación":f"+{pos['stop_dist_pct']*3:.1f}%",
+                 "P&L estimado":f"+${pos['gain_t3']:,.0f}","R/R":f"{pos['rr_3']:.1f}"},
+            ])
+            st.table(rr_data.set_index("Nivel"))
+
+            # ── Gráfico de niveles ──
+            fig_sz = go.Figure()
+            price_range = [pos["stop"]*0.98, pos["target_3"]*1.02]
+            for lvl, color, label in [
+                (pos["stop"],     "#f87171", f"Stop ${pos['stop']:,.0f}"),
+                (pos["price"],    "#fbbf24", f"Entrada ${pos['price']:,.0f}"),
+                (pos["target_1"], "#4ade80", f"T1 ${pos['target_1']:,.0f}"),
+                (pos["target_2"], "#00d4aa", f"T2 ${pos['target_2']:,.0f}"),
+                (pos["target_3"], "#a78bfa", f"T3 ${pos['target_3']:,.0f}"),
+            ]:
+                fig_sz.add_shape(type="line", x0=0, x1=1, y0=lvl, y1=lvl,
+                                 line=dict(color=color, width=2, dash="dash"))
+                fig_sz.add_annotation(x=1.01, y=lvl, text=label,
+                                      showarrow=False, xref="paper",
+                                      font=dict(color=color, size=11), xanchor="left")
+
+            # Zona de riesgo (rojo) y ganancia (verde)
+            fig_sz.add_shape(type="rect", x0=0, x1=1, y0=pos["stop"], y1=pos["price"],
+                             fillcolor="rgba(248,113,113,0.08)", line_width=0)
+            fig_sz.add_shape(type="rect", x0=0, x1=1, y0=pos["price"], y1=pos["target_2"],
+                             fillcolor="rgba(74,222,128,0.06)", line_width=0)
+
+            fig_sz.update_layout(
+                template="plotly_dark", height=320,
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+                margin=dict(l=10, r=120, t=10, b=10),
+                xaxis=dict(visible=False),
+                yaxis=dict(tickprefix="$", gridcolor="rgba(255,255,255,0.04)",
+                           range=price_range),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_sz, use_container_width=True)
+
+            # ── Resumen ejecutable ──
+            st.markdown("#### 📋 Orden de compra sugerida")
+            orden_txt = (
+                f"Ticker:        {sz_ticker}\n"
+                f"Accion:        COMPRA\n"
+                f"Cantidad:      {pos['shares']:,} acciones\n"
+                f"Precio limite: ${pos['price']:,.2f}\n"
+                f"Stop Loss:     ${pos['stop']:,.2f}  (-{pos['stop_dist_pct']:.1f}%)\n"
+                f"Target 1:      ${pos['target_1']:,.2f}  (R/R {pos['rr_1']:.1f})\n"
+                f"Target 2:      ${pos['target_2']:,.2f}  (R/R {pos['rr_2']:.1f})\n"
+                f"Capital:       ${pos['net_invest']:,.0f}  ({pos['pct_capital']:.1f}% del total)\n"
+                f"Riesgo max.:   ${pos['loss_sl']:,.0f}  ({sz_risk_pct}% del capital)"
+            )
+            st.code(orden_txt, language="text")
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
