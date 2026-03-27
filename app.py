@@ -1435,7 +1435,10 @@ def build_drawdown_chart(
 ) -> go.Figure:
     """Drawdown desde máximo para cada ticker seleccionado."""
     fig = go.Figure()
-    COLORS = ["#00d4aa", "#a78bfa", "#fb923c", "#f43f5e", "#38bdf8"]
+    COLORS      = ["#00d4aa", "#a78bfa", "#fb923c", "#f43f5e", "#38bdf8"]
+    FILL_COLORS = ["rgba(0,212,170,0.08)", "rgba(167,139,250,0.08)",
+                   "rgba(251,146,60,0.08)", "rgba(244,63,94,0.08)",
+                   "rgba(56,189,248,0.08)"]
 
     for i, ticker in enumerate(tickers):
         sym  = ticker if ticker.endswith(".BA") else ticker + ".BA"
@@ -1446,12 +1449,13 @@ def build_drawdown_chart(
         roll_max = close.cummax()
         dd       = (close - roll_max) / roll_max * 100
         color    = COLORS[i % len(COLORS)]
+        fcolor   = FILL_COLORS[i % len(FILL_COLORS)]
         fig.add_trace(go.Scatter(
             x=dd.index, y=dd.values,
             name=ticker,
             line=dict(color=color, width=1.5),
             fill="tozeroy",
-            fillcolor=color.replace("#", "rgba(").rstrip(")") + ",0.08)" if "#" in color else color,
+            fillcolor=fcolor,
             hovertemplate=f"<b>{ticker}</b><br>%{{x}}<br>DD: %{{y:.1f}}%<extra></extra>",
         ))
 
