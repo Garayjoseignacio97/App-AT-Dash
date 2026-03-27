@@ -1559,6 +1559,12 @@ def calc_position(
 # ─── APP PRINCIPAL ────────────────────────────────────────────────────────────
 
 def main():
+    # ══ SESSION STATE — inicializar siempre al inicio ═════════════════════
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = load_watchlist()
+    if HIST_KEY not in st.session_state:
+        st.session_state[HIST_KEY] = []
+
     # ══ SIDEBAR ══════════════════════════════════════════════════════════════
 
     with st.sidebar:
