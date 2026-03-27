@@ -1289,14 +1289,7 @@ def build_correlation_heatmap(data: dict[str, pd.DataFrame], min_periods: int = 
         zmin=-1, zmax=1,
         text=[[f"{v:.2f}" for v in row] for row in matrix],
         texttemplate="%{text}",
-        textfont=dict(size=8, color="white"),
         hovertemplate="<b>%{y}</b> vs <b>%{x}</b><br>Correlación: %{z:.3f}<extra></extra>",
-        colorbar=dict(
-            title="Correlación", tickvals=[-1,-0.5,0,0.5,1],
-            ticktext=["-1","−0.5","0","+0.5","+1"],
-            tickfont=dict(size=10, color="#cbd5e1"),
-            titlefont=dict(size=11, color="#cbd5e1"),
-        ),
     ))
 
     n = len(labels)
@@ -2371,7 +2364,6 @@ def main():
                     zmin=-8, zmax=8,
                     text=pivot.values.astype(int).astype(str),
                     texttemplate="%{text}",
-                    textfont=dict(size=9),
                     hovertemplate="<b>%{y}</b><br>%{x}<br>Score: %{z}<extra></extra>",
                 ))
                 fig_heat.update_layout(
