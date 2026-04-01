@@ -1401,7 +1401,17 @@ def build_comparison_chart(
         ))
 
     if merval_df is not None and len(merval_df) > 1:
+        if isinstance(merval_df.columns, pd.MultiIndex):
+            merval_df.columns = merval_df.columns.get_level_values(0)
         close_m = merval_df["Close"].dropna()
+        if len(close_m) < 2:
+            merval_df = None
+        else:
+            first_val = float(close_m.iloc[0])
+            if first_val == 0 or pd.isna(first_val):
+                merval_df = None
+    if merval_df is not None and len(merval_df) > 1:
+        close_m  = merval_df["Close"].dropna()
         normed_m = close_m / float(close_m.iloc[0]) * 100
         var_m   = round(float(normed_m.iloc[-1]) - 100, 2)
         fig.add_trace(go.Scatter(
@@ -2617,7 +2627,10 @@ def main():
                     raw_m = yf.download("^MERV", period=comp_period,
                                         auto_adjust=True, progress=False)
                     if not raw_m.empty:
-                        merval_df = raw_m
+                        # Aplanar MultiIndex si yfinance lo devuelve así
+                        if isinstance(raw_m.columns, pd.MultiIndex):
+                            raw_m.columns = raw_m.columns.get_level_values(0)
+                        merval_df = raw_m.dropna(subset=["Close"])
                 except Exception:
                     pass
 
