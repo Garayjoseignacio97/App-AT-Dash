@@ -789,144 +789,40 @@ def build_score_chart(score_s: pd.Series, df: pd.DataFrame,
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_fundamentals(tickers_tuple: tuple) -> dict[str, dict]:
     """
-    Descarga métricas fundamentales con estrategia de dos capas:
-    1. yfinance.info (rápido, a veces incompleto para .BA)
-    2. Estados financieros (.financials, .balance_sheet, .income_stmt) como fallback
-    Cache de 24 horas.
+    Descarga métricas fundamentales desde yfinance.info.
+    Cache de 24 horas. Filtra NaN e infinitos para evitar errores de display.
     """
     result = {}
 
     def _safe(val):
-        """Retorna None si el valor es NaN, inf o no numérico."""
         try:
             f = float(val)
             return None if (f != f or abs(f) == float("inf")) else f
         except Exception:
             return None
 
-    def _last_val(df, *row_names):
-        """Extrae el último valor disponible de una fila de un DataFrame financiero."""
-        if df is None or df.empty:
-            return None
-        for name in row_names:
-            for idx in df.index:
-                if name.lower() in str(idx).lower():
-                    row = df.loc[idx].dropna()
-                    if not row.empty:
-                        return _safe(float(row.iloc[0]))
-        return None
-
     def _fetch(ticker: str):
         try:
-            t_obj = yf.Ticker(ticker)
-            info  = t_obj.info or {}
-
-            # ── Capa 1: campos directos de .info ──
-            pe          = _safe(info.get("trailingPE"))
-            pb          = _safe(info.get("priceToBook"))
-            ev_ebitda   = _safe(info.get("enterpriseToEbitda"))
-            roe         = _safe(info.get("returnOnEquity"))
-            roa         = _safe(info.get("returnOnAssets"))
-            margen_neto = _safe(info.get("profitMargins"))
-            debt_eq     = _safe(info.get("debtToEquity"))
-            current     = _safe(info.get("currentRatio"))
-            div_yield   = _safe(info.get("dividendYield"))
-            payout      = _safe(info.get("payoutRatio"))
-            market_cap  = _safe(info.get("marketCap"))
-            price       = _safe(info.get("currentPrice") or info.get("regularMarketPrice"))
-
-            # ── Capa 2: estados financieros si .info está vacío ──
-            # Solo intentar si faltan los campos clave
-            needs_fallback = any(v is None for v in [pe, pb, roe, margen_neto])
-            if needs_fallback:
-                try:
-                    fin   = t_obj.financials          # Income Statement anual
-                    bal   = t_obj.balance_sheet        # Balance Sheet anual
-                    cf    = t_obj.cashflow             # Cash Flow anual
-
-                    # Precio actual
-                    if price is None:
-                        try:
-                            price = _safe(t_obj.fast_info.last_price)
-                        except Exception:
-                            pass
-
-                    # — Ingresos y ganancias —
-                    net_income  = _last_val(fin, "Net Income")
-                    revenue     = _last_val(fin, "Total Revenue", "Revenue")
-                    ebitda      = _last_val(fin, "EBITDA", "Ebitda")
-                    op_income   = _last_val(fin, "Operating Income", "EBIT")
-
-                    # — Balance —
-                    total_eq    = _last_val(bal, "Stockholders Equity", "Total Equity",
-                                            "Common Stock Equity")
-                    total_assets= _last_val(bal, "Total Assets")
-                    total_debt  = _last_val(bal, "Total Debt", "Long Term Debt")
-                    curr_assets = _last_val(bal, "Current Assets")
-                    curr_liab   = _last_val(bal, "Current Liabilities")
-                    shares      = _safe(info.get("sharesOutstanding")) or                                   _last_val(bal, "Ordinary Shares Number", "Share Issued")
-
-                    # — Book value por acción —
-                    if pb is None and price and total_eq and shares and shares > 0:
-                        book_per_share = total_eq / shares
-                        if book_per_share > 0:
-                            pb = _safe(price / book_per_share)
-
-                    # — P/E trailing —
-                    if pe is None and price and net_income and shares and shares > 0:
-                        eps = net_income / shares
-                        if eps > 0:
-                            pe = _safe(price / eps)
-
-                    # — EV/EBITDA —
-                    if ev_ebitda is None and ebitda and market_cap and total_debt is not None:
-                        ev = market_cap + (total_debt or 0)
-                        if ebitda > 0:
-                            ev_ebitda = _safe(ev / ebitda)
-
-                    # — ROE —
-                    if roe is None and net_income and total_eq and total_eq > 0:
-                        roe = _safe(net_income / total_eq)
-
-                    # — ROA —
-                    if roa is None and net_income and total_assets and total_assets > 0:
-                        roa = _safe(net_income / total_assets)
-
-                    # — Margen neto —
-                    if margen_neto is None and net_income and revenue and revenue > 0:
-                        margen_neto = _safe(net_income / revenue)
-
-                    # — Debt/Equity —
-                    if debt_eq is None and total_debt is not None and total_eq and total_eq > 0:
-                        debt_eq = _safe(total_debt / total_eq)
-
-                    # — Current Ratio —
-                    if current is None and curr_assets and curr_liab and curr_liab > 0:
-                        current = _safe(curr_assets / curr_liab)
-
-                    # — Dividend Yield —
-                    if div_yield is None:
-                        div_per_share = _safe(info.get("dividendRate"))
-                        if div_per_share and price and price > 0:
-                            div_yield = _safe(div_per_share / price)
-
-                except Exception:
-                    pass  # fallback silencioso
-
+            info = yf.Ticker(ticker).info or {}
             result[ticker] = {
-                "pe": pe, "pb": pb, "ev_ebitda": ev_ebitda,
-                "roe": roe, "roa": roa, "margen_neto": margen_neto,
-                "debt_eq": debt_eq, "current": current,
-                "div_yield": div_yield, "payout": payout,
-                "market_cap": market_cap,
-                "sector": info.get("sector"),
-                "employees": info.get("fullTimeEmployees"),
+                "pe":          _safe(info.get("trailingPE")),
+                "pb":          _safe(info.get("priceToBook")),
+                "ev_ebitda":   _safe(info.get("enterpriseToEbitda")),
+                "roe":         _safe(info.get("returnOnEquity")),
+                "roa":         _safe(info.get("returnOnAssets")),
+                "margen_neto": _safe(info.get("profitMargins")),
+                "debt_eq":     _safe(info.get("debtToEquity")),
+                "current":     _safe(info.get("currentRatio")),
+                "div_yield":   _safe(info.get("dividendYield")),
+                "payout":      _safe(info.get("payoutRatio")),
+                "market_cap":  _safe(info.get("marketCap")),
+                "sector":      info.get("sector"),
+                "employees":   info.get("fullTimeEmployees"),
             }
-
         except Exception:
             result[ticker] = {}
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         pool.map(_fetch, list(tickers_tuple))
     return result
 
@@ -1137,7 +1033,7 @@ def fetch_macro() -> dict:
     """
     Obtiene variables macro argentinas desde APIs públicas.
     - Tipos de cambio: dolarapi.com
-    - Riesgo país: ambito.com
+    - Riesgo país: argentinadatos.com (primario) / ambito.com (respaldo)
     Cache: 5 minutos.
     """
     result = {
@@ -1173,19 +1069,32 @@ def fetch_macro() -> dict:
             result["brecha_ccl"]  = round((result["ccl"]  / result["oficial"] - 1) * 100, 1)
 
     # ── Riesgo país ──
-    try:
-        import urllib.request, json as _json
-        req2 = urllib.request.Request(
-            "https://mercados.ambito.com/riesgo-pais/referencia",
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        )
-        with urllib.request.urlopen(req2, timeout=6) as r:
-            rp_data = _json.loads(r.read().decode())
-        val = rp_data.get("valor") or rp_data.get("ultimo") or rp_data.get("value")
-        if val:
-            result["riesgo_pais"] = float(str(val).replace(",", ".").replace(".", "", str(val).count(".")-1))
-    except Exception:
-        pass
+    # Fuentes en orden de prioridad — se usa la primera que responda
+    import urllib.request as _ur, json as _json
+
+    _rp_sources = [
+        # 1. ArgentinaDatos (API pública sin auth, muy estable)
+        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais/ultimo",
+         lambda d: float(d.get("valor", 0)) if isinstance(d, dict) else float(d[-1].get("valor", 0))),
+        # 2. ArgentinaDatos histórico (endpoint alternativo)
+        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais",
+         lambda d: float(d[-1].get("valor", 0)) if isinstance(d, list) and d else 0),
+        # 3. Ámbito (respaldo)
+        ("https://mercados.ambito.com/riesgo-pais/referencia",
+         lambda d: float(str(d.get("valor") or d.get("ultimo") or 0).replace(",", "."))),
+    ]
+
+    for url, parser in _rp_sources:
+        try:
+            req2 = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            with _ur.urlopen(req2, timeout=6) as r:
+                rp_data = _json.loads(r.read().decode())
+            val = parser(rp_data)
+            if val and val > 0:
+                result["riesgo_pais"] = round(val, 0)
+                break
+        except Exception:
+            continue
 
     return result
 
