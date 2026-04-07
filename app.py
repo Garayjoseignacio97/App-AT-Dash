@@ -786,7 +786,7 @@ def build_score_chart(score_s: pd.Series, df: pd.DataFrame,
 
 # ─── ANÁLISIS FUNDAMENTAL ─────────────────────────────────────────────────────
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)
 def fetch_fundamentals(tickers_tuple: tuple) -> dict[str, dict]:
     """
     Descarga métricas fundamentales desde yfinance.info.
@@ -1157,9 +1157,7 @@ def render_macro_panel():
     ccl   = _fmt_dolar(macro["ccl"])
     b_bl  = f"{macro['brecha_blue']:+.1f}%" if macro["brecha_blue"] is not None else "—"
     b_ccl = f"{macro['brecha_ccl']:+.1f}%"  if macro["brecha_ccl"]  is not None else "—"
-    rp       = f"{macro['riesgo_pais']:,.0f} bps" if macro["riesgo_pais"] else "—"
-    rp_debug = macro.get("rp_debug", "")
-    rp_fuente= macro.get("rp_fuente", "")
+    rp = f"{macro['riesgo_pais']:,.0f} bps" if macro["riesgo_pais"] else "—"
 
     bc  = _brecha_color(macro["brecha_ccl"])
     bbc = _brecha_color(macro["brecha_blue"])
@@ -1198,10 +1196,8 @@ def render_macro_panel():
       <span style="font-size:13px">
         <span style="color:#64748b">Riesgo País </span>
         <span style="color:{rpc};font-weight:700">{rp}</span>
-        {f'<span style="color:#475569;font-size:10px"> ({rp_fuente})</span>' if rp_fuente else ''}
       </span>
     </div>
-    {f'<div style="font-size:10px;color:#475569;padding:2px 20px;background:#0d0f17">⚙️ RP: {rp_debug[:180]}</div>' if rp_debug and not macro.get("riesgo_pais") else ''}
     """, unsafe_allow_html=True)
 
 
@@ -2168,7 +2164,14 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     with tab5:
         st.subheader("📑 Análisis Fundamental")
-        st.caption("Datos: yfinance · Cache 24 hs · Cobertura variable según ticker (mejor en Panel Líder)")
+
+        f5c1, f5c2 = st.columns([4, 1])
+        with f5c1:
+            st.caption("Datos: yfinance · Cache 6 hs · Cobertura variable según ticker (mejor en Panel Líder)")
+        with f5c2:
+            if st.button("🔄 Actualizar fundamentales", key="refresh_fund"):
+                st.cache_data.clear()
+                st.rerun()
 
         f_mode = st.radio("Vista", ["Ticker individual", "Screener fundamental"],
                           horizontal=True)
