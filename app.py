@@ -1092,6 +1092,11 @@ def fetch_macro() -> dict:
 
     _rp_debug = []
     _rp_sources = [
+        # ArgentinaDatos — endpoints correctos con guión
+        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo",
+         lambda d: _parse_num(d.get("valor", 0)) if isinstance(d, dict) else 0),
+        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais",
+         lambda d: _parse_num(d[-1].get("valor", 0)) if isinstance(d, list) and d else 0),
         # dolarapi — mismo dominio que funciona para los dólares
         ("https://dolarapi.com/v1/indices/riesgo-pais",
          lambda d: _parse_num(d.get("valor") or d.get("value") or 0)),
@@ -1101,10 +1106,6 @@ def fetch_macro() -> dict:
          if isinstance(d, list) else 0),
         ("https://criptoya.com/api/riesgo-pais",
          lambda d: _parse_num(d.get("value") or d.get("valor") or 0)),
-        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais/ultimo",
-         lambda d: _parse_num(d.get("valor", 0)) if isinstance(d, dict) else 0),
-        ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais",
-         lambda d: _parse_num(d[-1].get("valor", 0)) if isinstance(d, list) and d else 0),
         ("https://api.bcra.gob.ar/estadisticas/v3.0/datosVariable/5/2025-01-01/2026-04-06",
          lambda d: _parse_num(d.get("results", [{}])[-1].get("valor", 0))
          if isinstance(d, dict) and d.get("results") else 0),
