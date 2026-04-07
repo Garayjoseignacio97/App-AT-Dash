@@ -1069,14 +1069,11 @@ def fetch_macro() -> dict:
             result["brecha_ccl"]  = round((result["ccl"]  / result["oficial"] - 1) * 100, 1)
 
     # ── Riesgo país ──
-    # 5 fuentes en cascada — se usa la primera que responda con dato válido
     import urllib.request as _ur, json as _json
 
     def _parse_num(s):
-        """Convierte string con comas/puntos a float robusto."""
         try:
             s = str(s).strip().replace(" ", "").replace(" ", "")
-            # Si hay coma y punto, asumir punto como separador de miles
             if "," in s and "." in s:
                 s = s.replace(".", "").replace(",", ".")
             elif "," in s:
@@ -1085,44 +1082,52 @@ def fetch_macro() -> dict:
         except Exception:
             return 0.0
 
+    _hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Origin": "https://www.google.com",
+    }
+
+    _rp_debug = []
     _rp_sources = [
-        # 1. CriptoYa — API argentina conocida, sin auth
+        # dolarapi — mismo dominio que funciona para los dólares
+        ("https://dolarapi.com/v1/indices/riesgo-pais",
+         lambda d: _parse_num(d.get("valor") or d.get("value") or 0)),
+        ("https://dolarapi.com/v1/indices",
+         lambda d: _parse_num(next((x.get("valor", 0) for x in d
+                              if "riesgo" in str(x.get("nombre","")).lower()), 0))
+         if isinstance(d, list) else 0),
         ("https://criptoya.com/api/riesgo-pais",
-         lambda d: _parse_num(d.get("value") or d.get("valor") or d.get("riesgo_pais") or 0)
-         if isinstance(d, dict) else 0),
-        # 2. ArgentinaDatos — último valor
+         lambda d: _parse_num(d.get("value") or d.get("valor") or 0)),
         ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais/ultimo",
          lambda d: _parse_num(d.get("valor", 0)) if isinstance(d, dict) else 0),
-        # 3. ArgentinaDatos — histórico, toma el último
         ("https://api.argentinadatos.com/v1/finanzas/indices/riesgoais",
          lambda d: _parse_num(d[-1].get("valor", 0)) if isinstance(d, list) and d else 0),
-        # 4. BCRA API oficial — variable 5 = Riesgo País EMBI
-        (f"https://api.bcra.gob.ar/estadisticas/v3.0/datosVariable/5/2025-01-01/2026-04-06",
+        ("https://api.bcra.gob.ar/estadisticas/v3.0/datosVariable/5/2025-01-01/2026-04-06",
          lambda d: _parse_num(d.get("results", [{}])[-1].get("valor", 0))
          if isinstance(d, dict) and d.get("results") else 0),
-        # 5. Ámbito — respaldo original
         ("https://mercados.ambito.com/riesgo-pais/referencia",
-         lambda d: _parse_num(d.get("valor") or d.get("ultimo") or 0) if isinstance(d, dict) else 0),
+         lambda d: _parse_num(d.get("valor") or d.get("ultimo") or 0)),
     ]
 
-    for url, parser in _rp_sources:
+    for _url, _parser in _rp_sources:
         try:
-            req2 = _ur.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
-                "Referer": "https://www.google.com/",
-            })
-            with _ur.urlopen(req2, timeout=8) as r:
-                raw = r.read().decode("utf-8", errors="replace")
-                rp_data = _json.loads(raw)
-            val = parser(rp_data)
-            if val and val > 100:   # riesgo país siempre > 100 bps
-                result["riesgo_pais"] = round(val, 0)
+            _req2 = _ur.Request(_url, headers=_hdrs)
+            with _ur.urlopen(_req2, timeout=8) as _r:
+                _rp_data = _json.loads(_r.read().decode("utf-8", errors="replace"))
+            _val = _parser(_rp_data)
+            if _val and _val > 100:
+                result["riesgo_pais"] = round(_val, 0)
+                result["rp_fuente"]   = _url.split("/")[2]
                 break
-        except Exception:
-            continue
+            else:
+                _rp_debug.append(f"✓{_url.split('/')[2]}=val:{_val}")
+        except Exception as _e:
+            _rp_debug.append(f"✗{_url.split('/')[2]}:{str(_e)[:30]}")
 
+    result["rp_debug"] = " | ".join(_rp_debug)
     return result
 
 
@@ -1151,7 +1156,9 @@ def render_macro_panel():
     ccl   = _fmt_dolar(macro["ccl"])
     b_bl  = f"{macro['brecha_blue']:+.1f}%" if macro["brecha_blue"] is not None else "—"
     b_ccl = f"{macro['brecha_ccl']:+.1f}%"  if macro["brecha_ccl"]  is not None else "—"
-    rp    = f"{macro['riesgo_pais']:,.0f} bps" if macro["riesgo_pais"] else "—"
+    rp       = f"{macro['riesgo_pais']:,.0f} bps" if macro["riesgo_pais"] else "—"
+    rp_debug = macro.get("rp_debug", "")
+    rp_fuente= macro.get("rp_fuente", "")
 
     bc  = _brecha_color(macro["brecha_ccl"])
     bbc = _brecha_color(macro["brecha_blue"])
@@ -1190,8 +1197,10 @@ def render_macro_panel():
       <span style="font-size:13px">
         <span style="color:#64748b">Riesgo País </span>
         <span style="color:{rpc};font-weight:700">{rp}</span>
+        {f'<span style="color:#475569;font-size:10px"> ({rp_fuente})</span>' if rp_fuente else ''}
       </span>
     </div>
+    {f'<div style="font-size:10px;color:#475569;padding:2px 20px;background:#0d0f17">⚙️ RP: {rp_debug[:180]}</div>' if rp_debug and not macro.get("riesgo_pais") else ''}
     """, unsafe_allow_html=True)
 
 
