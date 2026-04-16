@@ -790,8 +790,11 @@ def build_score_chart(score_s: pd.Series, df: pd.DataFrame,
 def fetch_fundamentals(tickers_tuple: tuple) -> dict[str, dict]:
     """
     Descarga métricas fundamentales desde yfinance.info.
-    Cache de 24 horas. Filtra NaN e infinitos para evitar errores de display.
+    Cache de 6 horas. Workers reducidos para evitar rate limiting de Yahoo.
+    Solo cachea si obtuvo al menos algún dato válido.
     """
+    import time
+
     result = {}
 
     def _safe(val):
@@ -801,29 +804,47 @@ def fetch_fundamentals(tickers_tuple: tuple) -> dict[str, dict]:
         except Exception:
             return None
 
-    def _fetch(ticker: str):
-        try:
-            info = yf.Ticker(ticker).info or {}
-            result[ticker] = {
-                "pe":          _safe(info.get("trailingPE")),
-                "pb":          _safe(info.get("priceToBook")),
-                "ev_ebitda":   _safe(info.get("enterpriseToEbitda")),
-                "roe":         _safe(info.get("returnOnEquity")),
-                "roa":         _safe(info.get("returnOnAssets")),
-                "margen_neto": _safe(info.get("profitMargins")),
-                "debt_eq":     _safe(info.get("debtToEquity")),
-                "current":     _safe(info.get("currentRatio")),
-                "div_yield":   _safe(info.get("dividendYield")),
-                "payout":      _safe(info.get("payoutRatio")),
-                "market_cap":  _safe(info.get("marketCap")),
-                "sector":      info.get("sector"),
-                "employees":   info.get("fullTimeEmployees"),
-            }
-        except Exception:
-            result[ticker] = {}
+    def _has_data(d: dict) -> bool:
+        keys = ["pe","pb","roe","roa","margen_neto","ev_ebitda","debt_eq","current"]
+        return any(d.get(k) is not None for k in keys)
 
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    def _fetch(ticker: str):
+        for attempt in range(2):  # hasta 2 intentos por ticker
+            try:
+                info = yf.Ticker(ticker).info or {}
+                d = {
+                    "pe":          _safe(info.get("trailingPE")),
+                    "pb":          _safe(info.get("priceToBook")),
+                    "ev_ebitda":   _safe(info.get("enterpriseToEbitda")),
+                    "roe":         _safe(info.get("returnOnEquity")),
+                    "roa":         _safe(info.get("returnOnAssets")),
+                    "margen_neto": _safe(info.get("profitMargins")),
+                    "debt_eq":     _safe(info.get("debtToEquity")),
+                    "current":     _safe(info.get("currentRatio")),
+                    "div_yield":   _safe(info.get("dividendYield")),
+                    "payout":      _safe(info.get("payoutRatio")),
+                    "market_cap":  _safe(info.get("marketCap")),
+                    "sector":      info.get("sector"),
+                    "employees":   info.get("fullTimeEmployees"),
+                }
+                result[ticker] = d
+                return
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1)  # pausa antes del reintento
+        result[ticker] = {}
+
+    # Workers reducidos a 4 para no saturar la API de Yahoo
+    with ThreadPoolExecutor(max_workers=4) as pool:
         pool.map(_fetch, list(tickers_tuple))
+
+    # Si no se obtuvo NINGÚN dato, devolver vacío sin cachear
+    # (forzar re-fetch la próxima vez)
+    tickers_con_datos = sum(1 for v in result.values() if _has_data(v))
+    if tickers_con_datos == 0:
+        # Limpiar cache de esta llamada para que no quede guardado vacío
+        fetch_fundamentals.clear()
+
     return result
 
 
@@ -1732,7 +1753,7 @@ def main():
 
     # ══ TABS ═══════════════════════════════════════════════════════════════
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Ranking & Screener", "📈 Análisis Individual", "🔔 Alertas", "🧪 Backtester", "📑 Análisis Fundamental", "💱 CEDEARs", "🔗 Correlación", "📜 Historial", "⚖️ Comparador", "📋 Watchlist", "🎯 Sizing"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Ranking & Screener", "📑 Análisis Fundamental", "📈 Análisis Individual", "💱 CEDEARs", "⚖️ Comparador", "🔔 Alertas", "🎯 Sizing", "🧪 Backtester", "🔗 Correlación", "📋 Watchlist", "📜 Historial"])
 
     # ─────────────────────────────────────────────────────────────────────
     # TAB 1 — RANKING
@@ -1804,7 +1825,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 2 — ANÁLISIS INDIVIDUAL
     # ─────────────────────────────────────────────────────────────────────
-    with tab2:
+    with tab3:
         ticker_opts = list(detail_store.keys())
         selected = st.selectbox(
             "Seleccioná un ticker para análisis completo",
@@ -1899,7 +1920,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 3 — ALERTAS (en pantalla)
     # ─────────────────────────────────────────────────────────────────────
-    with tab3:
+    with tab6:
         st.subheader("🔔 Alertas de señales técnicas activas")
 
         alert_rows = []
@@ -1973,7 +1994,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 4 — BACKTESTER
     # ─────────────────────────────────────────────────────────────────────
-    with tab4:
+    with tab8:
         st.subheader("🧪 Backtester de Estrategia Técnica")
         st.caption("Simulación histórica basada en el score técnico del screener. No incluye comisiones ni slippage.")
 
@@ -2162,7 +2183,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 5 — ANÁLISIS FUNDAMENTAL
     # ─────────────────────────────────────────────────────────────────────
-    with tab5:
+    with tab2:
         st.subheader("📑 Análisis Fundamental")
 
         f5c1, f5c2 = st.columns([4, 1])
@@ -2379,7 +2400,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 6 — CEDEARs
     # ─────────────────────────────────────────────────────────────────────
-    with tab6:
+    with tab4:
         st.subheader("💱 Tracker de CEDEARs — Dólar Implícito")
         st.caption("Compara el CCL implícito de cada CEDEAR vs el CCL de referencia del panel macro.")
 
@@ -2467,7 +2488,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 7 — CORRELACIÓN
     # ─────────────────────────────────────────────────────────────────────
-    with tab7:
+    with tab9:
         st.subheader("🔗 Correlación entre papeles")
         st.caption("Correlación de retornos diarios. Verde = alta correlación positiva · Rojo = correlación negativa · Centro = sin relación.")
 
@@ -2538,7 +2559,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 8 — HISTORIAL DE SEÑALES
     # ─────────────────────────────────────────────────────────────────────
-    with tab8:
+    with tab11:
         st.subheader("📜 Historial de Señales")
         st.caption("Registro automático de cada estado del screener durante la sesión. Se guarda en memoria; exportá el CSV para conservarlo entre sesiones.")
 
@@ -2651,7 +2672,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 9 — COMPARADOR
     # ─────────────────────────────────────────────────────────────────────
-    with tab9:
+    with tab5:
         st.subheader("⚖️ Comparador de Papeles")
         st.caption("Retornos normalizados (base 100) — compará performance relativa entre tickers y vs el Merval.")
 
@@ -2868,7 +2889,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     # TAB 11 — SIZING
     # ─────────────────────────────────────────────────────────────────────
-    with tab11:
+    with tab7:
         st.subheader("🎯 Simulador de Posición & Sizing")
         st.caption("Calculá el tamaño óptimo de cada operación basado en tu capital y riesgo por trade.")
 
