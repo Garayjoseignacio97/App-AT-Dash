@@ -126,7 +126,16 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi_val = 100 - (100 / (1 + rs))
+    # Casos límite: avg_loss.replace(0, nan) deja NaN cuando no hubo pérdidas en la
+    # ventana (tendencia alcista pura, común en small caps ilíquidas del panel
+    # general) — sin este ajuste, el bug original devolvía NaN en vez de RSI=100,
+    # y esas ruedas quedaban invisibles para el scoring.
+    sin_perdidas = (avg_loss == 0) & (avg_gain > 0)
+    sin_cambios  = (avg_loss == 0) & (avg_gain == 0)
+    rsi_val = rsi_val.mask(sin_perdidas, 100.0)
+    rsi_val = rsi_val.mask(sin_cambios, 50.0)
+    return rsi_val
 
 
 def macd(series: pd.Series, fast=12, slow=26, signal=9):
@@ -196,52 +205,24 @@ def support_resistance(close: pd.Series, high: pd.Series, low: pd.Series, window
 
 # ─── SCORING SWING TRADING ───────────────────────────────────────────────────
 
-def score_ticker(df: pd.DataFrame) -> tuple[int, list[str], str, dict]:
+def _score_from_snapshot(
+    price: float, s20: float, s50: float, s20_prev: float, s50_prev: float,
+    macd_v: float, macd_prev: float, msig_v: float, msig_prev: float,
+    mh_v: float, mh_prev: float,
+    rsi_v: float, pct_b_v: float, bb_w_v: float,
+    k_v: float, k_prev: float, d_v: float, d_prev: float,
+    rvol_v: float,
+) -> tuple[int, list[str]]:
     """
-    Evalúa señales técnicas orientadas a swing trading.
-    Retorna: (score, señales, recomendación, métricas)
+    Núcleo de scoring técnico. Compartido entre score_ticker() (última rueda, con
+    detalle para la UI del Screener) y compute_score_series() (serie histórica
+    para el Backtester), para que el score que ranquea hoy sea matemáticamente el
+    mismo que el que se backtestea — antes vivían duplicados y podían divergir.
     """
-    empty = (0, [], "Sin datos", {})
-    if df is None or len(df) < 55:
-        return empty
-
-    close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
-
-    # ── Calcular indicadores ──
-    rsi_s             = rsi(close)
-    macd_l, macd_sig, macd_h = macd(close)
-    bb_u, bb_m, bb_l, pct_b_s, bb_w_s = bollinger(close)
-    atr_s             = atr(high, low, close)
-    k_s, d_s          = stochastic(high, low, close)
-    rvol_s            = rvol(volume)
-    sma20_s           = close.rolling(20).mean()
-    sma50_s           = close.rolling(50).mean()
-    nearest_s, nearest_r, _ = support_resistance(close, high, low)
-
-    # ── Últimos valores ──
-    rsi_v    = float(rsi_s.iloc[-1])
-    macd_v   = float(macd_l.iloc[-1])
-    msig_v   = float(macd_sig.iloc[-1])
-    mh_v     = float(macd_h.iloc[-1])
-    mh_prev  = float(macd_h.iloc[-2])
-    pct_b_v  = float(pct_b_s.iloc[-1])
-    bb_w_v   = float(bb_w_s.iloc[-1])
-    k_v      = float(k_s.iloc[-1])
-    d_v      = float(d_s.iloc[-1])
-    k_prev   = float(k_s.iloc[-2])
-    d_prev   = float(d_s.iloc[-2])
-    rvol_v   = float(rvol_s.iloc[-1])
-    price    = float(close.iloc[-1])
-    sma20_v  = float(sma20_s.iloc[-1])
-    sma50_v  = float(sma50_s.iloc[-1])
-    atr_v    = float(atr_s.iloc[-1])
-
-    score   = 0
-    signals = []
+    score = 0
+    signals: list[str] = []
 
     # 1. MACD — cruce y momentum
-    macd_prev   = float(macd_l.iloc[-2])
-    msig_prev   = float(macd_sig.iloc[-2])
     if macd_v > msig_v and macd_prev <= msig_prev:
         score += 2; signals.append("✅ MACD: cruce alcista (señal fuerte)")
     elif macd_v < msig_v and macd_prev >= msig_prev:
@@ -274,8 +255,7 @@ def score_ticker(df: pd.DataFrame) -> tuple[int, list[str], str, dict]:
     elif 0.45 <= pct_b_v <= 0.55:
         score += 1; signals.append("✅ Precio en zona media BB (momentum)")
 
-    # Compresión de bandas (squeeze → posible ruptura)
-    if bb_w_v < 0.05:
+    if not np.isnan(bb_w_v) and bb_w_v < 0.05:
         score += 1; signals.append("✅ BB squeeze detectado — posible ruptura inminente")
 
     # 4. Estocástico — cruce
@@ -296,15 +276,81 @@ def score_ticker(df: pd.DataFrame) -> tuple[int, list[str], str, dict]:
     elif rvol_v < 0.5:
         score -= 1; signals.append(f"⚠️ RVOL bajo ({rvol_v:.1f}x) — sin convicción")
 
-    # 6. Tendencia (SMAs)
-    if price > sma20_v > sma50_v:
+    # 6. Cruce SMA20/50 — evento reciente (dorado/muerte), señal fuerte y distinta
+    #    de la posición relativa de las medias (punto 7). Antes solo se evaluaba
+    #    la posición, así que un cruce que ya llevaba 40 ruedas pesaba igual que
+    #    uno que acababa de ocurrir — se perdía la parte de "timing" de la señal.
+    if s20 > s50 and s20_prev <= s50_prev:
+        score += 2; signals.append("✅ Cruce dorado: SMA20 cruzó por encima de SMA50")
+    elif s20 < s50 and s20_prev >= s50_prev:
+        score -= 2; signals.append("🔴 Cruce de la muerte: SMA20 cruzó por debajo de SMA50")
+
+    # 7. Tendencia (posición de SMAs) — confirmación, más débil que el cruce en sí
+    if price > s20 > s50:
         score += 1; signals.append("✅ Tendencia alcista confirmada (P > SMA20 > SMA50)")
-    elif price < sma20_v < sma50_v:
+    elif price < s20 < s50:
         score -= 1; signals.append("🔴 Tendencia bajista confirmada (P < SMA20 < SMA50)")
-    elif price > sma20_v and sma20_v < sma50_v:
+    elif price > s20 and s20 < s50:
         signals.append("👁️ Precio sobre SMA20 pero SMA20 aún bajo SMA50 — recuperación")
 
-    # 7. Soporte / Resistencia
+    return score, signals
+
+
+def score_ticker(df: pd.DataFrame) -> tuple[int, list[str], str, dict]:
+    """
+    Evalúa señales técnicas orientadas a swing trading.
+    Retorna: (score, señales, recomendación, métricas)
+    """
+    empty = (0, [], "Sin datos", {})
+    if df is None or len(df) < 55:
+        return empty
+
+    close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
+
+    # ── Calcular indicadores ──
+    rsi_s             = rsi(close)
+    macd_l, macd_sig, macd_h = macd(close)
+    bb_u, bb_m, bb_l, pct_b_s, bb_w_s = bollinger(close)
+    atr_s             = atr(high, low, close)
+    k_s, d_s          = stochastic(high, low, close)
+    rvol_s            = rvol(volume)
+    sma20_s           = close.rolling(20).mean()
+    sma50_s           = close.rolling(50).mean()
+    nearest_s, nearest_r, _ = support_resistance(close, high, low)
+
+    # ── Últimos valores ──
+    rsi_v    = float(rsi_s.iloc[-1])
+    macd_v   = float(macd_l.iloc[-1])
+    msig_v   = float(macd_sig.iloc[-1])
+    mh_v     = float(macd_h.iloc[-1])
+    mh_prev  = float(macd_h.iloc[-2])
+    macd_prev = float(macd_l.iloc[-2])
+    msig_prev = float(macd_sig.iloc[-2])
+    pct_b_v  = float(pct_b_s.iloc[-1])
+    bb_w_v   = float(bb_w_s.iloc[-1])
+    k_v      = float(k_s.iloc[-1])
+    d_v      = float(d_s.iloc[-1])
+    k_prev   = float(k_s.iloc[-2])
+    d_prev   = float(d_s.iloc[-2])
+    rvol_v   = float(rvol_s.iloc[-1])
+    price    = float(close.iloc[-1])
+    sma20_v  = float(sma20_s.iloc[-1])
+    sma50_v  = float(sma50_s.iloc[-1])
+    sma20_prev = float(sma20_s.iloc[-2])
+    sma50_prev = float(sma50_s.iloc[-2])
+    atr_v    = float(atr_s.iloc[-1])
+
+    score, signals = _score_from_snapshot(
+        price, sma20_v, sma50_v, sma20_prev, sma50_prev,
+        macd_v, macd_prev, msig_v, msig_prev, mh_v, mh_prev,
+        rsi_v, pct_b_v, bb_w_v,
+        k_v, k_prev, d_v, d_prev, rvol_v,
+    )
+
+    # Soporte/Resistencia — queda fuera del núcleo compartido porque
+    # support_resistance() recorre toda la serie por rueda: incluirlo en
+    # compute_score_series() (que la llama una vez por cada una de las ~n ruedas
+    # del backtest) sería O(n²) y ralentizaría el backtester sin necesidad.
     if nearest_s and abs(price - nearest_s) / price < 0.025:
         score += 1; signals.append(f"✅ Precio próximo a soporte (${nearest_s:,.1f})")
     if nearest_r and abs(price - nearest_r) / price < 0.025:
@@ -377,6 +423,63 @@ def fetch_batch(tickers_tuple: tuple, period: str) -> dict[str, pd.DataFrame]:
             continue
 
     return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_merval_close(period: str) -> pd.Series | None:
+    """Serie de cierre del Merval (^MERV) para el período dado. Se cachea por separado
+    de fetch_batch porque no siempre se necesita (solo Análisis Relativo y Control de Gestión)."""
+    try:
+        raw = yf.download("^MERV", period=period, auto_adjust=True, progress=False)
+        if raw.empty:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        return raw["Close"].dropna()
+    except Exception:
+        return None
+
+
+# ─── CALIDAD DE DATOS (técnica) ───────────────────────────────────────────────
+# Bandas mínimas esperadas de velas por período (aprox. ruedas hábiles * 0.85)
+PERIOD_EXPECTED_BARS = {"3mo": 47, "6mo": 95, "1y": 190, "2y": 380}
+
+
+def calidad_tecnica(df: pd.DataFrame, period: str) -> tuple[int, str, list[str]]:
+    """
+    Evalúa completitud/actualidad de los datos de precio de un ticker.
+    Score 0-3: +1 historial suficiente, +1 dato reciente (<=4 días), +1 volumen presente.
+    Retorna (score, emoji semáforo, detalle de problemas detectados).
+    """
+    problemas: list[str] = []
+    q = 0
+
+    if df is None or df.empty:
+        return 0, "🔴", ["Sin datos"]
+
+    esperado = PERIOD_EXPECTED_BARS.get(period, 95)
+    if len(df) >= esperado:
+        q += 1
+    else:
+        problemas.append(f"Historial corto ({len(df)}/{esperado} ruedas)")
+
+    try:
+        ultima_fecha = pd.Timestamp(df.index[-1]).tz_localize(None)
+        dias_desde = (pd.Timestamp.now().normalize() - ultima_fecha.normalize()).days
+    except Exception:
+        dias_desde = 99
+    if dias_desde <= 4:
+        q += 1
+    else:
+        problemas.append(f"Último dato hace {dias_desde}d")
+
+    if "Volume" in df.columns and df["Volume"].tail(20).fillna(0).gt(0).sum() >= 15:
+        q += 1
+    else:
+        problemas.append("Volumen incompleto")
+
+    emoji = "🟢" if q == 3 else ("🟡" if q == 2 else "🔴")
+    return q, emoji, problemas
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -520,7 +623,10 @@ def build_chart(df: pd.DataFrame, ticker: str, metrics: dict) -> go.Figure:
 # ─── BACKTESTER ───────────────────────────────────────────────────────────────
 
 def compute_score_series(df: pd.DataFrame) -> pd.Series:
-    """Calcula el score técnico para cada fecha del DataFrame (rolling)."""
+    """Calcula el score técnico para cada fecha del DataFrame (rolling).
+    Usa el mismo núcleo (_score_from_snapshot) que score_ticker(), así el score
+    que ve el Backtester es exactamente el que hubiera visto el Screener ese día
+    (salvo el componente de soporte/resistencia, ver nota en score_ticker)."""
     close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
     rsi_s              = rsi(close)
     macd_l, macd_sig, macd_h = macd(close)
@@ -532,44 +638,16 @@ def compute_score_series(df: pd.DataFrame) -> pd.Series:
 
     scores = pd.Series(np.nan, index=df.index, dtype=float)
     for i in range(55, len(df)):
-        s = 0
-        mv,  sv  = float(macd_l.iloc[i]),   float(macd_sig.iloc[i])
-        mvp, svp = float(macd_l.iloc[i-1]), float(macd_sig.iloc[i-1])
-        mhv, mhp = float(macd_h.iloc[i]),   float(macd_h.iloc[i-1])
-
-        if mv > sv and mvp <= svp:   s += 2
-        elif mv < sv and mvp >= svp: s -= 2
-        elif mv > sv:                s += 1
-        else:                        s -= 1
-        if mhv > 0 and mhv > mhp:   s += 1
-        elif mhv < 0 and mhv < mhp: s -= 1
-
-        rv = float(rsi_s.iloc[i])
-        if 45 <= rv <= 65:   s += 1
-        elif rv > 70:        s -= 1
-        elif rv < 30:        s += 1
-
-        pb = float(pct_b_s.iloc[i])
-        bw = float(bb_w_s.iloc[i])
-        if pb > 1.0:                 s -= 1
-        elif pb < 0.0:               s += 1
-        elif 0.45 <= pb <= 0.55:     s += 1
-        if not np.isnan(bw) and bw < 0.05: s += 1
-
-        kv, dv = float(k_s.iloc[i]), float(d_s.iloc[i])
-        kp, dp = float(k_s.iloc[i-1]), float(d_s.iloc[i-1])
-        if kv > dv and kp <= dp and kv < 80:  s += 2
-        elif kv < dv and kp >= dp and kv > 20: s -= 2
-
-        rv2 = float(rvol_s.iloc[i])
-        if rv2 > 2.5:   s += 2
-        elif rv2 > 1.5: s += 1
-        elif rv2 < 0.5: s -= 1
-
-        p, s20, s50 = float(close.iloc[i]), float(sma20_s.iloc[i]), float(sma50_s.iloc[i])
-        if p > s20 > s50:   s += 1
-        elif p < s20 < s50: s -= 1
-
+        s, _ = _score_from_snapshot(
+            float(close.iloc[i]), float(sma20_s.iloc[i]), float(sma50_s.iloc[i]),
+            float(sma20_s.iloc[i - 1]), float(sma50_s.iloc[i - 1]),
+            float(macd_l.iloc[i]), float(macd_l.iloc[i - 1]),
+            float(macd_sig.iloc[i]), float(macd_sig.iloc[i - 1]),
+            float(macd_h.iloc[i]), float(macd_h.iloc[i - 1]),
+            float(rsi_s.iloc[i]), float(pct_b_s.iloc[i]), float(bb_w_s.iloc[i]),
+            float(k_s.iloc[i]), float(k_s.iloc[i - 1]), float(d_s.iloc[i]), float(d_s.iloc[i - 1]),
+            float(rvol_s.iloc[i]),
+        )
         scores.iloc[i] = s
     return scores
 
@@ -1379,27 +1457,58 @@ def build_correlation_heatmap(data: dict[str, pd.DataFrame], min_periods: int = 
     return fig
 
 
-# ─── HISTORIAL DE SEÑALES ────────────────────────────────────────────────────
+# ─── HISTORIAL DE SEÑALES (persistente) ──────────────────────────────────────
 
-HIST_KEY = "signal_history"   # clave en st.session_state
+HIST_KEY         = "signal_history"        # clave en st.session_state
+SIGNAL_LOG_FILE  = "signal_history.json"   # persistencia en disco (mismo patrón que watchlist.json)
+SIGNAL_LOG_CAP   = 15000                   # tope de registros guardados para no crecer indefinidamente
+
+
+def load_signal_history() -> list[dict]:
+    """Carga el historial persistido en disco. Se usa para hidratar session_state al iniciar."""
+    try:
+        if os.path.exists(SIGNAL_LOG_FILE):
+            import json
+            return json.load(open(SIGNAL_LOG_FILE, "r"))
+    except Exception:
+        pass
+    return []
+
+
+def _persist_signal_history(records: list[dict]) -> None:
+    try:
+        import json
+        json.dump(records[-SIGNAL_LOG_CAP:], open(SIGNAL_LOG_FILE, "w"), indent=0)
+    except Exception:
+        pass
 
 
 def save_signal_snapshot(results_df: pd.DataFrame, macro: dict) -> None:
     """
-    Guarda un snapshot del screener actual en session_state.
-    Cada fila lleva timestamp, macro vars y señal técnica.
+    Guarda un snapshot del screener actual en session_state y lo persiste a disco
+    (signal_history.json) para que el hit ratio se pueda calcular entre sesiones,
+    no solo dentro de la sesión activa como antes.
     """
     if HIST_KEY not in st.session_state:
-        st.session_state[HIST_KEY] = []
+        st.session_state[HIST_KEY] = load_signal_history()
 
     ts  = datetime.now(timezone(timedelta(hours=-3))).strftime("%Y-%m-%d %H:%M")
+
+    # Evitar duplicar el mismo snapshot si Streamlit re-renderiza dentro del mismo minuto
+    ya_guardado = any(r.get("Timestamp") == ts for r in st.session_state[HIST_KEY][-len(results_df)-1:])
+    if ya_guardado:
+        return
+
     ccl = macro.get("ccl") or ""
     rp  = macro.get("riesgo_pais") or ""
 
+    nuevos = []
     for _, row in results_df.iterrows():
-        st.session_state[HIST_KEY].append({
+        nuevos.append({
             "Timestamp":    ts,
             "Ticker":       row["Ticker"],
+            "Panel":        row.get("Panel", "—"),
+            "Sector":       row.get("Sector", "—"),
             "Score":        row["Score"],
             "Señal":        row["Señal"],
             "Precio $":     row["Precio $"],
@@ -1409,6 +1518,115 @@ def save_signal_snapshot(results_df: pd.DataFrame, macro: dict) -> None:
             "CCL":          ccl,
             "Riesgo País":  rp,
         })
+
+    st.session_state[HIST_KEY].extend(nuevos)
+    _persist_signal_history(st.session_state[HIST_KEY])
+
+
+def resolve_signal_outcomes(hist_df: pd.DataFrame, data: dict, horizon: int = 5) -> pd.DataFrame:
+    """
+    Para cada señal histórica, busca el precio N ruedas después (dentro del período
+    de datos actualmente cargado) y clasifica el resultado:
+    - COMPRA/COMPRA FUERTE → Acierto si el retorno a horizon ruedas es positivo
+    - VENTA/VENTA FUERTE   → Acierto si el retorno a horizon ruedas es negativo
+    - NEUTRAL              → no se evalúa (no implica una acción)
+    Nota: sólo puede resolver señales cuyo ticker + fecha estén cubiertos por el
+    período histórico actualmente cargado (sidebar). Señales más viejas que ese
+    período, o muy recientes (sin `horizon` ruedas todavía), quedan "Pendiente".
+    """
+    df = hist_df.copy()
+    df["Timestamp_dt"] = pd.to_datetime(df["Timestamp"])
+
+    resultados, retornos, precios_fut = [], [], []
+    for _, row in df.iterrows():
+        sym = row["Ticker"]
+        ticker_ba = sym + ".BA"
+        df_price = data.get(ticker_ba)
+        señal = row["Señal"]
+
+        if df_price is None or df_price.empty or señal == "NEUTRAL":
+            resultados.append("N/A" if señal == "NEUTRAL" else "Sin datos")
+            retornos.append(None); precios_fut.append(None)
+            continue
+
+        close = df_price["Close"].dropna()
+        try:
+            idx = close.index
+            emit_date = pd.Timestamp(row["Timestamp_dt"]).tz_localize(None).normalize()
+            idx_naive = idx.tz_localize(None) if idx.tz is not None else idx
+            candidatos = idx_naive[idx_naive >= emit_date]
+            if len(candidatos) == 0:
+                resultados.append("Sin datos"); retornos.append(None); precios_fut.append(None)
+                continue
+            pos = idx_naive.get_indexer([candidatos[0]])[0]
+            target_pos = pos + horizon
+            if target_pos >= len(close):
+                resultados.append("Pendiente"); retornos.append(None); precios_fut.append(None)
+                continue
+
+            precio_emision = float(row["Precio $"])
+            precio_futuro  = float(close.iloc[target_pos])
+            ret = (precio_futuro / precio_emision - 1) * 100 if precio_emision else None
+        except Exception:
+            resultados.append("Sin datos"); retornos.append(None); precios_fut.append(None)
+            continue
+
+        precios_fut.append(round(precio_futuro, 2) if ret is not None else None)
+        retornos.append(round(ret, 2) if ret is not None else None)
+
+        if ret is None:
+            resultados.append("Sin datos")
+        elif señal in ("COMPRA FUERTE", "COMPRA"):
+            resultados.append("Acierto" if ret > 0 else "Fallo")
+        else:  # VENTA / VENTA FUERTE
+            resultados.append("Acierto" if ret < 0 else "Fallo")
+
+    df["Precio futuro"] = precios_fut
+    df["Retorno %"]     = retornos
+    df["Resultado"]     = resultados
+    return df
+
+
+def build_equity_curve_chart(evaluables: pd.DataFrame, merval_close: pd.Series | None) -> go.Figure:
+    """
+    Curva de equity acumulada (base 100) de las señales evaluadas, tomadas en orden
+    cronológico con tamaño equally-weighted, vs. el Merval en el mismo tramo. Es una
+    simplificación: no modela posiciones simultáneas ni tamaño real de cada operación,
+    sirve para ver la tendencia direccional del sistema.
+    """
+    df = evaluables.copy().sort_values("Timestamp_dt")
+
+    # Homogeneizar signo: en señales VENTA, un retorno de precio negativo es "a favor" del sistema
+    df["retorno_sistema"] = df.apply(
+        lambda r: r["Retorno %"] if r["Señal"] in ("COMPRA FUERTE", "COMPRA") else -r["Retorno %"],
+        axis=1,
+    )
+    df["equity"] = (1 + df["retorno_sistema"] / 100).cumprod() * 100
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["Timestamp_dt"], y=df["equity"], mode="lines+markers",
+        name="Sistema (señales)", line=dict(color="#4ade80", width=2),
+    ))
+
+    if merval_close is not None and not merval_close.empty:
+        mv_idx = merval_close.index.tz_localize(None) if merval_close.index.tz is not None else merval_close.index
+        mv = merval_close.copy()
+        mv.index = mv_idx
+        mv_norm = (mv / mv.iloc[0]) * 100
+        fig.add_trace(go.Scatter(
+            x=mv_norm.index, y=mv_norm.values, mode="lines",
+            name="Merval (buy & hold)", line=dict(color="#94a3b8", width=1.5, dash="dot"),
+        ))
+
+    fig.update_layout(
+        template="plotly_dark", height=380,
+        title="Equity acumulada de las señales evaluadas (base 100)",
+        xaxis_title="Fecha de señal", yaxis_title="Índice (base 100)",
+        legend=dict(orientation="h", y=1.12),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+    return fig
 
 
 def build_history_chart(hist_df: pd.DataFrame, ticker: str) -> go.Figure:
@@ -1591,48 +1809,64 @@ def calc_position(
     commission_pct: float = 0.006,
 ) -> dict:
     """
-    Calcula sizing óptimo de posición basado en riesgo fijo por operación.
+    Calcula sizing de posición por riesgo fijo, incorporando comisión de ida
+    Y vuelta (compra + venta) tanto en la cantidad de acciones como en las
+    ganancias/pérdidas proyectadas.
+
+    Corrección relevante: la versión anterior sólo restaba la comisión una vez
+    (al costo de entrada) y la sumaba tal cual a la pérdida del stop, sin
+    incluirla en el cálculo de `shares`. Con eso, la pérdida real ante un stop
+    terminaba siendo mayor al `risk_pct` declarado — la etiqueta "Riesgo
+    máximo" de la UI prometía algo que el cálculo no garantizaba. Ahora el
+    denominador de `shares` incluye la comisión de entrada + salida al precio
+    de stop, de modo que `loss_sl` coincide con el `risk_amount` pedido.
     """
-    risk_amount  = capital * (risk_pct / 100)
-    stop_dist    = atr * atr_mult
-    stop_price   = price - stop_dist
-    shares       = max(1, int(risk_amount / stop_dist))
+    risk_amount = capital * (risk_pct / 100)
+    stop_dist   = atr * atr_mult
+    stop_price  = price - stop_dist
 
-    gross_invest = shares * price
-    commission   = gross_invest * commission_pct
-    net_invest   = gross_invest + commission
-    pct_capital  = net_invest / capital * 100
+    # Riesgo por acción incluyendo comisión de entrada y de salida en el stop
+    riesgo_por_accion = stop_dist + commission_pct * (price + stop_price)
+    shares = max(1, int(risk_amount / riesgo_por_accion)) if riesgo_por_accion > 0 else 1
 
-    target_1     = price + stop_dist           # 1:1
-    target_2     = price + stop_dist * 2       # 1:2
-    target_3     = price + stop_dist * 3       # 1:3
+    gross_invest     = shares * price
+    entry_commission = gross_invest * commission_pct
+    net_invest       = gross_invest + entry_commission
+    pct_capital      = net_invest / capital * 100 if capital else 0
 
-    gain_t1      = (target_1 - price) * shares - commission
-    gain_t2      = (target_2 - price) * shares - commission
-    gain_t3      = (target_3 - price) * shares - commission
-    loss_sl      = (price - stop_price) * shares + commission
+    target_1 = price + stop_dist           # 1:1
+    target_2 = price + stop_dist * 2       # 1:2
+    target_3 = price + stop_dist * 3       # 1:3
+
+    def _exit_commission(exit_price: float) -> float:
+        return shares * exit_price * commission_pct
+
+    gain_t1 = (target_1 - price) * shares - entry_commission - _exit_commission(target_1)
+    gain_t2 = (target_2 - price) * shares - entry_commission - _exit_commission(target_2)
+    gain_t3 = (target_3 - price) * shares - entry_commission - _exit_commission(target_3)
+    loss_sl = (price - stop_price) * shares + entry_commission + _exit_commission(stop_price)
 
     return {
-        "shares":       shares,
-        "price":        round(price, 2),
-        "stop":         round(stop_price, 2),
-        "stop_dist":    round(stop_dist, 2),
-        "stop_dist_pct":round(stop_dist / price * 100, 2),
-        "target_1":     round(target_1, 2),
-        "target_2":     round(target_2, 2),
-        "target_3":     round(target_3, 2),
-        "gross_invest": round(gross_invest, 2),
-        "commission":   round(commission, 2),
-        "net_invest":   round(net_invest, 2),
-        "pct_capital":  round(pct_capital, 2),
-        "risk_amount":  round(risk_amount, 2),
-        "gain_t1":      round(gain_t1, 2),
-        "gain_t2":      round(gain_t2, 2),
-        "gain_t3":      round(gain_t3, 2),
-        "loss_sl":      round(loss_sl, 2),
-        "rr_1":         round(gain_t1 / loss_sl, 2) if loss_sl > 0 else 0,
-        "rr_2":         round(gain_t2 / loss_sl, 2) if loss_sl > 0 else 0,
-        "rr_3":         round(gain_t3 / loss_sl, 2) if loss_sl > 0 else 0,
+        "shares":        shares,
+        "price":         round(price, 2),
+        "stop":          round(stop_price, 2),
+        "stop_dist":     round(stop_dist, 2),
+        "stop_dist_pct": round(stop_dist / price * 100, 2) if price else 0,
+        "target_1":      round(target_1, 2),
+        "target_2":      round(target_2, 2),
+        "target_3":      round(target_3, 2),
+        "gross_invest":  round(gross_invest, 2),
+        "commission":    round(entry_commission, 2),
+        "net_invest":    round(net_invest, 2),
+        "pct_capital":   round(pct_capital, 2),
+        "risk_amount":   round(risk_amount, 2),
+        "gain_t1":       round(gain_t1, 2),
+        "gain_t2":       round(gain_t2, 2),
+        "gain_t3":       round(gain_t3, 2),
+        "loss_sl":       round(loss_sl, 2),
+        "rr_1":          round(gain_t1 / loss_sl, 2) if loss_sl > 0 else 0,
+        "rr_2":          round(gain_t2 / loss_sl, 2) if loss_sl > 0 else 0,
+        "rr_3":          round(gain_t3 / loss_sl, 2) if loss_sl > 0 else 0,
     }
 
 
@@ -1643,7 +1877,7 @@ def main():
     if "watchlist" not in st.session_state:
         st.session_state["watchlist"] = load_watchlist()
     if HIST_KEY not in st.session_state:
-        st.session_state[HIST_KEY] = []
+        st.session_state[HIST_KEY] = load_signal_history()
 
     # ══ SIDEBAR ══════════════════════════════════════════════════════════════
 
@@ -1715,6 +1949,8 @@ def main():
         price_p = float(df["Close"].iloc[-2]) if len(df) > 1 else price
         var     = (price / price_p - 1) * 100 if price_p else 0.0
 
+        q_score, q_emoji, q_problemas = calidad_tecnica(df, period)
+
         sym = ticker.replace(".BA", "")
         rows.append({
             "Ticker":        sym,
@@ -1733,8 +1969,10 @@ def main():
             "Target 1":      metrics["target_1"],
             "Target 2":      metrics["target_2"],
             "N° Señales":    len(signals),
+            "Calidad":       q_emoji,
         })
-        detail_store[sym] = {"df": df, "metrics": metrics, "signals": signals, "score": score, "rec": rec}
+        detail_store[sym] = {"df": df, "metrics": metrics, "signals": signals, "score": score, "rec": rec,
+                              "calidad_q": q_score, "calidad_emoji": q_emoji, "calidad_problemas": q_problemas}
 
     if not rows:
         st.info("Sin resultados con los filtros actuales. Bajá el score mínimo o ampliá el panel/sector.")
@@ -1753,7 +1991,7 @@ def main():
 
     # ══ TABS ═══════════════════════════════════════════════════════════════
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(["📊 Ranking & Screener", "📑 Análisis Fundamental", "📈 Análisis Individual", "💱 CEDEARs", "⚖️ Comparador", "🔔 Alertas", "🎯 Sizing", "🧪 Backtester", "🔗 Correlación", "📋 Watchlist", "📜 Historial"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["📊 Ranking & Screener", "📑 Análisis Fundamental", "📈 Análisis Individual", "💱 CEDEARs", "📐 Análisis Relativo", "🎯 Sizing", "🧪 Backtester", "📋 Watchlist", "🗂️ Control de Gestión"])
 
     # ─────────────────────────────────────────────────────────────────────
     # TAB 1 — RANKING
@@ -1784,8 +2022,10 @@ def main():
         )
         filtered_df = results_df[results_df["Señal"].isin(señal_filter)] if señal_filter else results_df
 
+        st.caption("Calidad de datos: 🟢 completo · 🟡 parcial · 🔴 con problemas (historial corto, dato viejo o volumen incompleto). Detalle agregado en Control de Gestión.")
+
         # ── Tabla con colores ──
-        display_cols = ["Ticker","Nombre","Panel","Sector","Precio $","Var %","Score","Señal","RSI","RVOL","N° Señales"]
+        display_cols = ["Ticker","Nombre","Panel","Sector","Precio $","Var %","Score","Señal","RSI","RVOL","N° Señales","Calidad"]
 
         def _color_señal(val):
             c, bg = REC_COLORS.get(val, ("#aaa","#222"))
@@ -1823,7 +2063,7 @@ def main():
         )
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 2 — ANÁLISIS INDIVIDUAL
+    # TAB 3 — ANÁLISIS INDIVIDUAL
     # ─────────────────────────────────────────────────────────────────────
     with tab3:
         ticker_opts = list(detail_store.keys())
@@ -1918,83 +2158,9 @@ def main():
                                  f"+{abs(metrics['resistance'] - price) / price * 100:.1f}%")
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 3 — ALERTAS (en pantalla)
+    # TAB 7 — BACKTESTER
     # ─────────────────────────────────────────────────────────────────────
-    with tab6:
-        st.subheader("🔔 Alertas de señales técnicas activas")
-
-        alert_rows = []
-        for sym, d in detail_store.items():
-            nombre, sector, panel = TICKERS.get(sym + ".BA", ("?", "?", "?"))
-            df_t  = d["df"]
-            price = float(df_t["Close"].iloc[-1])
-            for sig in d["signals"]:
-                if "✅" in sig:
-                    tipo = "BULLISH"
-                elif "🔴" in sig:
-                    tipo = "BEARISH"
-                else:
-                    tipo = "WATCH"
-                alert_rows.append({
-                    "Ticker":  sym,
-                    "Panel":   panel,
-                    "Sector":  sector,
-                    "Precio $": round(price, 2),
-                    "Score":   d["score"],
-                    "Tipo":    tipo,
-                    "Señal":   sig,
-                })
-
-        if not alert_rows:
-            st.info("Sin alertas para los tickers del filtro actual.")
-        else:
-            alerts_df = pd.DataFrame(alert_rows)
-
-            a1, a2, a3 = st.columns(3)
-            a1.metric("🟢 BULLISH", len(alerts_df[alerts_df["Tipo"] == "BULLISH"]))
-            a2.metric("🔴 BEARISH", len(alerts_df[alerts_df["Tipo"] == "BEARISH"]))
-            a3.metric("👁️ WATCH",   len(alerts_df[alerts_df["Tipo"] == "WATCH"]))
-
-            st.divider()
-
-            tipo_filter = st.radio("Mostrar", ["Todas", "BULLISH", "BEARISH", "WATCH"], horizontal=True)
-            if tipo_filter != "Todas":
-                alerts_df = alerts_df[alerts_df["Tipo"] == tipo_filter]
-
-            def _color_tipo(val):
-                m = {"BULLISH": "background-color:#0f2318;color:#4ade80;font-weight:700",
-                     "BEARISH": "background-color:#2b1010;color:#f87171;font-weight:700",
-                     "WATCH":   "background-color:#2b2410;color:#fbbf24;font-weight:700"}
-                return m.get(val, "")
-
-            st.dataframe(
-                alerts_df.style
-                    .map(_color_tipo, subset=["Tipo"])
-                    .map(_color_score, subset=["Score"])
-                    .format({"Precio $": "${:,.2f}", "Score": "{:+d}"}),
-                use_container_width=True,
-                height=480,
-            )
-
-            # ── Top oportunidades bullish ──
-            st.subheader("🏆 Top oportunidades bullish (score + señales)")
-            top = (
-                alerts_df[alerts_df["Tipo"] == "BULLISH"]
-                .groupby("Ticker")
-                .agg(N_señales=("Señal", "count"), Score=("Score", "first"), Precio=("Precio $", "first"))
-                .sort_values(["Score", "N_señales"], ascending=False)
-                .head(10)
-            )
-            if not top.empty:
-                st.dataframe(top, use_container_width=True)
-            else:
-                st.info("Sin señales bullish en el filtro actual.")
-
-
-    # ─────────────────────────────────────────────────────────────────────
-    # TAB 4 — BACKTESTER
-    # ─────────────────────────────────────────────────────────────────────
-    with tab8:
+    with tab7:
         st.subheader("🧪 Backtester de Estrategia Técnica")
         st.caption("Simulación histórica basada en el score técnico del screener. No incluye comisiones ni slippage.")
 
@@ -2181,7 +2347,7 @@ def main():
 
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 5 — ANÁLISIS FUNDAMENTAL
+    # TAB 2 — ANÁLISIS FUNDAMENTAL
     # ─────────────────────────────────────────────────────────────────────
     with tab2:
         st.subheader("📑 Análisis Fundamental")
@@ -2398,7 +2564,7 @@ def main():
 
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 6 — CEDEARs
+    # TAB 4 — CEDEARs
     # ─────────────────────────────────────────────────────────────────────
     with tab4:
         st.subheader("💱 Tracker de CEDEARs — Dólar Implícito")
@@ -2486,90 +2652,145 @@ def main():
                                "cedears_ccl.csv", "text/csv")
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 7 — CORRELACIÓN
+    # TAB 9 — CONTROL DE GESTIÓN (ex Historial de señales)
     # ─────────────────────────────────────────────────────────────────────
     with tab9:
-        st.subheader("🔗 Correlación entre papeles")
-        st.caption("Correlación de retornos diarios. Verde = alta correlación positiva · Rojo = correlación negativa · Centro = sin relación.")
+        st.subheader("🗂️ Control de Gestión")
+        st.caption("KPIs de performance del sistema de señales, calidad de datos y registro histórico persistente (signal_history.json).")
 
-        col_opt1, col_opt2 = st.columns([2, 2])
-        with col_opt1:
-            corr_panel = st.multiselect(
-                "Panel a incluir", ["Líder", "General"],
-                default=["Líder"], key="corr_panel"
-            )
-        with col_opt2:
-            corr_min   = st.slider("Mínimo de ruedas con datos", 20, 60, 30, 5, key="corr_min")
+        hist    = st.session_state.get(HIST_KEY, [])
+        hist_df = pd.DataFrame(hist) if hist else pd.DataFrame()
 
-        # Filtrar data por panel
-        corr_data = {
-            k: v for k, v in data.items()
-            if TICKERS.get(k, ("","","?"))[2] in corr_panel
-        }
+        # ═══ SECCIÓN 1 — PERFORMANCE DEL SISTEMA DE SEÑALES ═══════════════
+        st.markdown("### 📊 Performance del sistema de señales")
 
-        if len(corr_data) < 2:
-            st.info("Necesitás al menos 2 tickers para calcular correlación. Ampliá el panel.")
+        if hist_df.empty:
+            st.info("Aún no hay señales registradas. El historial se guarda automáticamente en cada carga de la app.")
         else:
-            with st.spinner("Calculando matriz de correlación…"):
-                fig_corr = build_correlation_heatmap(corr_data, min_periods=corr_min)
+            horizon = st.slider(
+                "Horizonte de evaluación (ruedas hábiles)", 3, 20, 5, 1,
+                help="A cuántas ruedas después de emitida la señal se mide el resultado (retorno y acierto/fallo).",
+                key="kpi_horizon",
+            )
 
-            if not fig_corr.data:
-                st.warning("Sin suficientes datos comunes. Reducí el mínimo de ruedas.")
+            resolved   = resolve_signal_outcomes(hist_df, data, horizon=horizon)
+            evaluables = resolved[resolved["Resultado"].isin(["Acierto", "Fallo"])]
+
+            if evaluables.empty:
+                st.info(
+                    "Ninguna señal registrada tiene todavía suficientes ruedas posteriores, dentro del período "
+                    "histórico cargado en el sidebar, para evaluarse. Es esperable al empezar a usar el historial "
+                    "persistente — con el uso diario de la app este panel se va a ir poblando."
+                )
             else:
-                st.plotly_chart(fig_corr, use_container_width=True)
+                hit_ratio = (evaluables["Resultado"] == "Acierto").mean() * 100
+                n_eval    = len(evaluables)
+                ret_prom  = evaluables["Retorno %"].mean()
+                aciertos_ret = evaluables.loc[evaluables["Resultado"] == "Acierto", "Retorno %"].mean()
+                fallos_ret   = evaluables.loc[evaluables["Resultado"] == "Fallo",   "Retorno %"].mean()
 
-                # ── Pares más correlacionados / menos correlacionados ──
-                ret_map = {}
-                for ticker, df_c in corr_data.items():
-                    sym = ticker.replace(".BA", "")
-                    try:
-                        r = df_c["Close"].pct_change().dropna()
-                        if len(r) >= corr_min:
-                            ret_map[sym] = r
-                    except Exception:
-                        continue
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("🎯 Hit ratio global", f"{hit_ratio:.0f}%", f"{n_eval} señales evaluadas")
+                k2.metric("📐 Retorno promedio", f"{ret_prom:+.2f}%", f"a {horizon} ruedas")
+                k3.metric("✅ Retorno prom. aciertos", f"{aciertos_ret:+.2f}%" if pd.notna(aciertos_ret) else "—")
+                k4.metric("🔴 Retorno prom. fallos",   f"{fallos_ret:+.2f}%"   if pd.notna(fallos_ret)   else "—")
 
-                if len(ret_map) >= 2:
-                    ret_df2  = pd.DataFrame(ret_map).dropna(how="all")
-                    corr_m   = ret_df2.corr()
-                    pairs = []
-                    cols_c = corr_m.columns.tolist()
-                    for i in range(len(cols_c)):
-                        for j in range(i+1, len(cols_c)):
-                            pairs.append({
-                                "Par":          f"{cols_c[i]} / {cols_c[j]}",
-                                "Correlación":  round(corr_m.iloc[i, j], 3),
-                            })
-                    pairs_df = pd.DataFrame(pairs).sort_values("Correlación", ascending=False)
+                st.markdown("#### Hit ratio por tipo de señal")
+                by_señal = (
+                    evaluables.groupby("Señal")
+                    .agg(N=("Resultado", "count"),
+                         Hit_ratio=("Resultado", lambda s: round((s == "Acierto").mean() * 100, 1)),
+                         Retorno_prom=("Retorno %", "mean"))
+                    .rename(columns={"Hit_ratio": "Hit ratio %", "Retorno_prom": "Retorno prom. %"})
+                    .sort_values("Hit ratio %", ascending=False)
+                )
+                st.dataframe(
+                    by_señal.style.format({"Hit ratio %": "{:.1f}%", "Retorno prom. %": "{:+.2f}%"}),
+                    use_container_width=True,
+                )
 
-                    cp1, cp2 = st.columns(2)
-                    with cp1:
-                        st.markdown("##### 🔴 Pares más correlacionados (mayor riesgo de concentración)")
-                        top_corr = pairs_df.head(8).style.format({"Correlación": "{:.3f}"})
-                        st.dataframe(top_corr, use_container_width=True, hide_index=True)
-                    with cp2:
-                        st.markdown("##### 🟢 Pares menos correlacionados (mayor diversificación)")
-                        low_corr = pairs_df.tail(8).style.format({"Correlación": "{:.3f}"})
-                        st.dataframe(low_corr, use_container_width=True, hide_index=True)
+                st.markdown("#### Hit ratio por sector")
+                if "Sector" in evaluables.columns and evaluables["Sector"].nunique() > 1:
+                    by_sector = (
+                        evaluables.groupby("Sector")
+                        .agg(N=("Resultado", "count"),
+                             Hit_ratio=("Resultado", lambda s: round((s == "Acierto").mean() * 100, 1)))
+                        .rename(columns={"Hit_ratio": "Hit ratio %"})
+                        .sort_values("Hit ratio %", ascending=False)
+                    )
+                    st.dataframe(by_sector.style.format({"Hit ratio %": "{:.1f}%"}), use_container_width=True)
+                else:
+                    st.caption("Se necesita historial de más de un sector para este desglose "
+                               "(las señales guardadas antes de esta actualización no tienen Sector registrado).")
 
-                    csv_corr = pairs_df.to_csv(index=False).encode("utf-8")
-                    st.download_button("📥 Exportar pares de correlación (CSV)",
-                                       csv_corr, "correlacion.csv", "text/csv")
+                st.caption(
+                    "⚠️ El hit ratio sólo cubre señales cuya fecha de emisión y horizonte caen dentro del período "
+                    "histórico cargado en el sidebar. Señales muy recientes figuran como 'Pendiente' hasta tener "
+                    "suficientes ruedas posteriores."
+                )
 
-    # ─────────────────────────────────────────────────────────────────────
-    # TAB 8 — HISTORIAL DE SEÑALES
-    # ─────────────────────────────────────────────────────────────────────
-    with tab11:
-        st.subheader("📜 Historial de Señales")
-        st.caption("Registro automático de cada estado del screener durante la sesión. Se guarda en memoria; exportá el CSV para conservarlo entre sesiones.")
+                st.markdown("#### Curva de equity acumulada vs Merval")
+                merval_close = fetch_merval_close(period)
+                if merval_close is None:
+                    st.caption("No se pudo descargar el Merval (^MERV) para la comparación en esta carga.")
+                fig_equity = build_equity_curve_chart(evaluables, merval_close)
+                st.plotly_chart(fig_equity, use_container_width=True)
 
-        hist = st.session_state.get(HIST_KEY, [])
+        st.divider()
+
+        # ═══ SECCIÓN 2 — CALIDAD DE DATOS ══════════════════════════════════
+        st.markdown("### 🔍 Calidad de datos")
+
+        q_rows = [
+            {"Ticker": sym, "Calidad": d["calidad_q"], "Emoji": d["calidad_emoji"],
+             "Problemas": ", ".join(d["calidad_problemas"]) if d["calidad_problemas"] else "—"}
+            for sym, d in detail_store.items()
+        ]
+        q_df = pd.DataFrame(q_rows)
+
+        if q_df.empty:
+            st.info("Sin datos para evaluar en este filtro.")
+        else:
+            n_verde, n_amar, n_rojo = (q_df["Emoji"] == "🟢").sum(), (q_df["Emoji"] == "🟡").sum(), (q_df["Emoji"] == "🔴").sum()
+            total_q = len(q_df)
+
+            qc1, qc2, qc3 = st.columns(3)
+            qc1.metric("🟢 Datos completos", f"{n_verde}", f"{n_verde/total_q*100:.0f}% del universo filtrado")
+            qc2.metric("🟡 Datos parciales", f"{n_amar}", f"{n_amar/total_q*100:.0f}%")
+            qc3.metric("🔴 Con problemas",   f"{n_rojo}", f"{n_rojo/total_q*100:.0f}%")
+
+            problematicos = q_df[q_df["Emoji"] != "🟢"].sort_values("Calidad")
+            if not problematicos.empty:
+                st.markdown("#### Tickers con datos incompletos")
+                st.dataframe(problematicos[["Ticker", "Emoji", "Problemas"]],
+                             use_container_width=True, hide_index=True)
+
+            st.markdown("#### Fuentes macro (dolarapi / riesgo país)")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                if macro_data.get("error"):
+                    st.error("dolarapi.com no respondió en esta carga (se muestran valores previos si había caché).")
+                else:
+                    st.success("dolarapi.com respondió correctamente.")
+            with mc2:
+                fuente_rp = macro_data.get("rp_fuente")
+                if fuente_rp:
+                    st.success(f"Riesgo país obtenido de: {fuente_rp}")
+                else:
+                    st.error("Ninguna fuente de riesgo país respondió en esta carga.")
+                    if macro_data.get("rp_debug"):
+                        with st.expander("Detalle de intentos"):
+                            st.code(macro_data["rp_debug"], language="text")
+
+        st.divider()
+
+        # ═══ SECCIÓN 3 — HISTORIAL DETALLADO ═══════════════════════════════
+        st.markdown("### 📜 Historial de señales (detalle)")
+        st.caption("Registro persistente en signal_history.json — se conserva entre sesiones y reinicios de la app. Exportá el CSV si querés analizarlo fuera de la app.")
 
         if not hist:
             st.info("El historial se genera automáticamente al cargar la app. Volvé a esta tab después de algunas actualizaciones.")
         else:
-            hist_df = pd.DataFrame(hist)
-
             # ── Métricas ──
             n_snaps  = hist_df["Timestamp"].nunique()
             n_ticks  = hist_df["Ticker"].nunique()
@@ -2664,125 +2885,197 @@ def main():
                 use_container_width=False,
             )
 
-            if st.button("🗑️ Limpiar historial de esta sesión", type="secondary"):
+            if st.button("🗑️ Limpiar historial persistente (signal_history.json)", type="secondary"):
                 st.session_state[HIST_KEY] = []
+                _persist_signal_history([])
                 st.rerun()
 
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 9 — COMPARADOR
+    # TAB 5 — ANÁLISIS RELATIVO (Comparador + Correlación)
     # ─────────────────────────────────────────────────────────────────────
     with tab5:
-        st.subheader("⚖️ Comparador de Papeles")
-        st.caption("Retornos normalizados (base 100) — compará performance relativa entre tickers y vs el Merval.")
+        st.subheader("📐 Análisis Relativo")
+        st.caption("Performance comparada y correlación entre papeles — dos vistas de la misma pregunta: cómo se mueve un activo respecto a otros.")
 
-        all_syms   = sorted([t.replace(".BA","") for t in data.keys()])
-        default_sel = all_syms[:3] if len(all_syms) >= 3 else all_syms
+        vista_rel = st.radio("Vista", ["📊 Retornos & Drawdown", "🔗 Correlación"],
+                             horizontal=True, key="vista_rel")
 
-        cp1, cp2 = st.columns([3, 1])
-        with cp1:
-            comp_tickers = st.multiselect(
-                "Seleccioná hasta 5 tickers para comparar",
-                all_syms,
-                default=default_sel,
-                max_selections=5,
-                key="comp_tickers",
-            )
-        with cp2:
-            show_merval = st.checkbox("Incluir Merval", value=True, key="comp_merval")
-            comp_period = st.selectbox("Período", ["3mo","6mo","1y","2y"], index=1,
-                                       format_func=lambda x: {"3mo":"3m","6mo":"6m","1y":"1a","2y":"2a"}[x],
-                                       key="comp_period")
+        if vista_rel == "📊 Retornos & Drawdown":
+            all_syms   = sorted([t.replace(".BA","") for t in data.keys()])
+            default_sel = all_syms[:3] if len(all_syms) >= 3 else all_syms
 
-        if not comp_tickers:
-            st.info("Seleccioná al menos un ticker.")
-        else:
-            # Descargar Merval si se pidió
-            merval_df = None
-            if show_merval:
-                try:
-                    raw_m = yf.download("^MERV", period=comp_period,
-                                        auto_adjust=True, progress=False)
-                    if not raw_m.empty:
-                        # Aplanar MultiIndex si yfinance lo devuelve así
-                        if isinstance(raw_m.columns, pd.MultiIndex):
-                            raw_m.columns = raw_m.columns.get_level_values(0)
-                        merval_df = raw_m.dropna(subset=["Close"])
-                except Exception:
-                    pass
-
-            # Re-fetch si el período difiere del cargado en sidebar
-            if comp_period != period:
-                with st.spinner("Descargando datos del período seleccionado…"):
-                    extra_tickers = [t+".BA" for t in comp_tickers]
-                    raw_comp = yf.download(extra_tickers, period=comp_period,
-                                           auto_adjust=True, progress=False,
-                                           group_by="ticker", threads=True)
-                    comp_data = {}
-                    for sym in comp_tickers:
-                        ticker_ba = sym + ".BA"
-                        try:
-                            if len(extra_tickers) == 1:
-                                comp_data[ticker_ba] = raw_comp.dropna(how="all")
-                            else:
-                                comp_data[ticker_ba] = raw_comp[ticker_ba].dropna(how="all")
-                        except Exception:
-                            pass
-            else:
-                comp_data = data
-
-            # ── Gráfico retornos normalizados ──
-            fig_comp = build_comparison_chart(comp_data, comp_tickers, merval_df)
-            st.plotly_chart(fig_comp, use_container_width=True)
-
-            # ── Drawdown ──
-            st.markdown("#### Drawdown desde máximo")
-            fig_dd = build_drawdown_chart(comp_data, comp_tickers)
-            st.plotly_chart(fig_dd, use_container_width=True)
-
-            # ── Tabla comparativa de métricas ──
-            st.markdown("#### Métricas comparativas")
-            comp_rows = []
-            for sym in comp_tickers:
-                ticker_ba = sym + ".BA"
-                df_c = comp_data.get(ticker_ba)
-                if df_c is None or len(df_c) < 5:
-                    continue
-                close_c = df_c["Close"].dropna()
-                roll_mx = close_c.cummax()
-                dd_s    = (close_c - roll_mx) / roll_mx * 100
-                daily_r = close_c.pct_change().dropna()
-                sharpe  = round(daily_r.mean() / daily_r.std() * (252**0.5), 2) if daily_r.std() > 0 else 0
-                nombre, sector, panel = TICKERS.get(ticker_ba, (sym,"—","—"))
-                comp_rows.append({
-                    "Ticker":       sym,
-                    "Panel":        panel,
-                    "Sector":       sector,
-                    "Retorno %":    round(float(close_c.iloc[-1]/close_c.iloc[0]-1)*100, 2),
-                    "Máx DD %":     round(float(dd_s.min()), 2),
-                    "Sharpe":       sharpe,
-                    "Vol. anual %": round(float(daily_r.std()) * (252**0.5) * 100, 2),
-                    "Precio":       round(float(close_c.iloc[-1]), 2),
-                })
-            if comp_rows:
-                comp_met_df = pd.DataFrame(comp_rows).set_index("Ticker")
-
-                def _cr(v): return "color:#4ade80;font-weight:700" if v>0 else "color:#f87171;font-weight:700"
-                def _dd(v): return "color:#f87171;font-weight:700" if v<-15 else "color:#fbbf24" if v<-5 else "color:#4ade80"
-
-                st.dataframe(
-                    comp_met_df.style
-                    .map(_cr, subset=["Retorno %"])
-                    .map(_dd, subset=["Máx DD %"])
-                    .format({"Retorno %":"{:+.2f}%","Máx DD %":"{:.2f}%",
-                             "Vol. anual %":"{:.2f}%","Precio":"${:,.2f}","Sharpe":"{:.2f}"}),
-                    use_container_width=True,
+            cp1, cp2 = st.columns([3, 1])
+            with cp1:
+                comp_tickers = st.multiselect(
+                    "Seleccioná hasta 5 tickers para comparar",
+                    all_syms,
+                    default=default_sel,
+                    max_selections=5,
+                    key="comp_tickers",
                 )
+            with cp2:
+                show_merval = st.checkbox("Incluir Merval", value=True, key="comp_merval")
+                comp_period = st.selectbox("Período", ["3mo","6mo","1y","2y"], index=1,
+                                           format_func=lambda x: {"3mo":"3m","6mo":"6m","1y":"1a","2y":"2a"}[x],
+                                           key="comp_period")
+
+            if not comp_tickers:
+                st.info("Seleccioná al menos un ticker.")
+            else:
+                # Descargar Merval si se pidió
+                merval_df = None
+                if show_merval:
+                    try:
+                        raw_m = yf.download("^MERV", period=comp_period,
+                                            auto_adjust=True, progress=False)
+                        if not raw_m.empty:
+                            # Aplanar MultiIndex si yfinance lo devuelve así
+                            if isinstance(raw_m.columns, pd.MultiIndex):
+                                raw_m.columns = raw_m.columns.get_level_values(0)
+                            merval_df = raw_m.dropna(subset=["Close"])
+                    except Exception:
+                        pass
+
+                # Re-fetch si el período difiere del cargado en sidebar
+                if comp_period != period:
+                    with st.spinner("Descargando datos del período seleccionado…"):
+                        extra_tickers = [t+".BA" for t in comp_tickers]
+                        raw_comp = yf.download(extra_tickers, period=comp_period,
+                                               auto_adjust=True, progress=False,
+                                               group_by="ticker", threads=True)
+                        comp_data = {}
+                        for sym in comp_tickers:
+                            ticker_ba = sym + ".BA"
+                            try:
+                                if len(extra_tickers) == 1:
+                                    comp_data[ticker_ba] = raw_comp.dropna(how="all")
+                                else:
+                                    comp_data[ticker_ba] = raw_comp[ticker_ba].dropna(how="all")
+                            except Exception:
+                                pass
+                else:
+                    comp_data = data
+
+                # ── Gráfico retornos normalizados ──
+                fig_comp = build_comparison_chart(comp_data, comp_tickers, merval_df)
+                st.plotly_chart(fig_comp, use_container_width=True)
+
+                # ── Drawdown ──
+                st.markdown("#### Drawdown desde máximo")
+                fig_dd = build_drawdown_chart(comp_data, comp_tickers)
+                st.plotly_chart(fig_dd, use_container_width=True)
+
+                # ── Tabla comparativa de métricas ──
+                st.markdown("#### Métricas comparativas")
+                comp_rows = []
+                for sym in comp_tickers:
+                    ticker_ba = sym + ".BA"
+                    df_c = comp_data.get(ticker_ba)
+                    if df_c is None or len(df_c) < 5:
+                        continue
+                    close_c = df_c["Close"].dropna()
+                    roll_mx = close_c.cummax()
+                    dd_s    = (close_c - roll_mx) / roll_mx * 100
+                    daily_r = close_c.pct_change().dropna()
+                    sharpe  = round(daily_r.mean() / daily_r.std() * (252**0.5), 2) if daily_r.std() > 0 else 0
+                    nombre, sector, panel = TICKERS.get(ticker_ba, (sym,"—","—"))
+                    comp_rows.append({
+                        "Ticker":       sym,
+                        "Panel":        panel,
+                        "Sector":       sector,
+                        "Retorno %":    round(float(close_c.iloc[-1]/close_c.iloc[0]-1)*100, 2),
+                        "Máx DD %":     round(float(dd_s.min()), 2),
+                        "Sharpe":       sharpe,
+                        "Vol. anual %": round(float(daily_r.std()) * (252**0.5) * 100, 2),
+                        "Precio":       round(float(close_c.iloc[-1]), 2),
+                    })
+                if comp_rows:
+                    comp_met_df = pd.DataFrame(comp_rows).set_index("Ticker")
+
+                    def _cr(v): return "color:#4ade80;font-weight:700" if v>0 else "color:#f87171;font-weight:700"
+                    def _dd(v): return "color:#f87171;font-weight:700" if v<-15 else "color:#fbbf24" if v<-5 else "color:#4ade80"
+
+                    st.dataframe(
+                        comp_met_df.style
+                        .map(_cr, subset=["Retorno %"])
+                        .map(_dd, subset=["Máx DD %"])
+                        .format({"Retorno %":"{:+.2f}%","Máx DD %":"{:.2f}%",
+                                 "Vol. anual %":"{:.2f}%","Precio":"${:,.2f}","Sharpe":"{:.2f}"}),
+                        use_container_width=True,
+                    )
+
+        else:
+            st.caption("Correlación de retornos diarios. Verde = alta correlación positiva · Rojo = correlación negativa · Centro = sin relación.")
+
+            col_opt1, col_opt2 = st.columns([2, 2])
+            with col_opt1:
+                corr_panel = st.multiselect(
+                    "Panel a incluir", ["Líder", "General"],
+                    default=["Líder"], key="corr_panel"
+                )
+            with col_opt2:
+                corr_min   = st.slider("Mínimo de ruedas con datos", 20, 60, 30, 5, key="corr_min")
+
+            # Filtrar data por panel
+            corr_data = {
+                k: v for k, v in data.items()
+                if TICKERS.get(k, ("","","?"))[2] in corr_panel
+            }
+
+            if len(corr_data) < 2:
+                st.info("Necesitás al menos 2 tickers para calcular correlación. Ampliá el panel.")
+            else:
+                with st.spinner("Calculando matriz de correlación…"):
+                    fig_corr = build_correlation_heatmap(corr_data, min_periods=corr_min)
+
+                if not fig_corr.data:
+                    st.warning("Sin suficientes datos comunes. Reducí el mínimo de ruedas.")
+                else:
+                    st.plotly_chart(fig_corr, use_container_width=True)
+
+                    # ── Pares más correlacionados / menos correlacionados ──
+                    ret_map = {}
+                    for ticker, df_c in corr_data.items():
+                        sym = ticker.replace(".BA", "")
+                        try:
+                            r = df_c["Close"].pct_change().dropna()
+                            if len(r) >= corr_min:
+                                ret_map[sym] = r
+                        except Exception:
+                            continue
+
+                    if len(ret_map) >= 2:
+                        ret_df2  = pd.DataFrame(ret_map).dropna(how="all")
+                        corr_m   = ret_df2.corr()
+                        pairs = []
+                        cols_c = corr_m.columns.tolist()
+                        for i in range(len(cols_c)):
+                            for j in range(i+1, len(cols_c)):
+                                pairs.append({
+                                    "Par":          f"{cols_c[i]} / {cols_c[j]}",
+                                    "Correlación":  round(corr_m.iloc[i, j], 3),
+                                })
+                        pairs_df = pd.DataFrame(pairs).sort_values("Correlación", ascending=False)
+
+                        cp1, cp2 = st.columns(2)
+                        with cp1:
+                            st.markdown("##### 🔴 Pares más correlacionados (mayor riesgo de concentración)")
+                            top_corr = pairs_df.head(8).style.format({"Correlación": "{:.3f}"})
+                            st.dataframe(top_corr, use_container_width=True, hide_index=True)
+                        with cp2:
+                            st.markdown("##### 🟢 Pares menos correlacionados (mayor diversificación)")
+                            low_corr = pairs_df.tail(8).style.format({"Correlación": "{:.3f}"})
+                            st.dataframe(low_corr, use_container_width=True, hide_index=True)
+
+                        csv_corr = pairs_df.to_csv(index=False).encode("utf-8")
+                        st.download_button("📥 Exportar pares de correlación (CSV)",
+                                           csv_corr, "correlacion.csv", "text/csv")
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 10 — WATCHLIST
+    # TAB 8 — WATCHLIST
     # ─────────────────────────────────────────────────────────────────────
-    with tab10:
+    with tab8:
         st.subheader("📋 Watchlist Personalizada")
         st.caption("Tu lista de seguimiento persistente. Se guarda en watchlist.json en el repositorio.")
 
@@ -2887,9 +3180,9 @@ def main():
                                "watchlist.csv", "text/csv")
 
     # ─────────────────────────────────────────────────────────────────────
-    # TAB 11 — SIZING
+    # TAB 6 — SIZING
     # ─────────────────────────────────────────────────────────────────────
-    with tab7:
+    with tab6:
         st.subheader("🎯 Simulador de Posición & Sizing")
         st.caption("Calculá el tamaño óptimo de cada operación basado en tu capital y riesgo por trade.")
 
