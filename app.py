@@ -425,21 +425,6 @@ def fetch_batch(tickers_tuple: tuple, period: str) -> dict[str, pd.DataFrame]:
     return result
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_merval_close(period: str) -> pd.Series | None:
-    """Serie de cierre del Merval (^MERV) para el período dado. Se cachea por separado
-    de fetch_batch porque no siempre se necesita (solo Análisis Relativo y Control de Gestión)."""
-    try:
-        raw = yf.download("^MERV", period=period, auto_adjust=True, progress=False)
-        if raw.empty:
-            return None
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        return raw["Close"].dropna()
-    except Exception:
-        return None
-
-
 # ─── CALIDAD DE DATOS (técnica) ───────────────────────────────────────────────
 # Bandas mínimas esperadas de velas por período (aprox. ruedas hábiles * 0.85)
 PERIOD_EXPECTED_BARS = {"3mo": 47, "6mo": 95, "1y": 190, "2y": 380}
@@ -761,6 +746,113 @@ def backtest_metrics(trades_df: pd.DataFrame, equity_s: pd.Series, bh_s: pd.Seri
         "Max Drawdown %": max_dd,
         "Avg días":       avg_dias,
     }
+
+
+# ─── VALIDACIÓN ESTADÍSTICA DEL BACKTESTER ────────────────────────────────────
+
+def walk_forward_folds(
+    df: pd.DataFrame, score_s: pd.Series, n_folds: int,
+    entry_threshold: int, hold_days: int, stop_pct: float, target_pct: float,
+) -> pd.DataFrame:
+    """
+    Divide el histórico en n_folds sub-períodos consecutivos y corre el backtest
+    de forma independiente en cada uno, con los mismos parámetros (no hay fitting
+    por fold — esta estrategia no tiene parámetros que se ajusten a los datos).
+    Sirve para ver si la performance es consistente a través del tiempo o si
+    depende de un tramo particular del período cargado en el sidebar.
+    """
+    n = len(df)
+    fold_size = n // n_folds
+    filas = []
+    for i in range(n_folds):
+        start = i * fold_size
+        end   = n if i == n_folds - 1 else (i + 1) * fold_size
+        if end - start < hold_days + 5:
+            continue
+        df_fold    = df.iloc[start:end]
+        score_fold = score_s.iloc[start:end]
+        trades_f, eq_f, bh_f = run_backtest(df_fold, score_fold, entry_threshold, hold_days, stop_pct, target_pct)
+        mets_f = backtest_metrics(trades_f, eq_f, bh_f)
+        filas.append({
+            "Fold":         f"{i + 1}",
+            "Desde":        df_fold.index[0].strftime("%d/%m/%y"),
+            "Hasta":        df_fold.index[-1].strftime("%d/%m/%y"),
+            "Retorno %":    mets_f["Total Return %"],
+            "B&H %":        mets_f["B&H Return %"],
+            "Win Rate %":   mets_f["Win Rate %"],
+            "Operaciones":  mets_f["N° Operaciones"],
+            "Sharpe":       mets_f["Sharpe"],
+            "Max DD %":     mets_f["Max Drawdown %"],
+        })
+    return pd.DataFrame(filas)
+
+
+def run_random_baseline(
+    df: pd.DataFrame, n_trades: int, hold_days: int, stop_pct: float, target_pct: float,
+    n_sims: int = 300, seed: int | None = None,
+) -> np.ndarray:
+    """
+    Simula n_sims backtests con entradas en fechas aleatorias (mismas reglas de
+    stop/target/hold que la estrategia real), para comparar el retorno total de
+    la estrategia contra lo que daría timing puramente aleatorio. Es una
+    simplificación intencional: permite solapamiento entre operaciones y no
+    modela capital limitado — el objetivo es aislar el aporte del *timing* de
+    entrada, no simular una cartera real (para eso está el Sizing Simulator).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(df)
+    if n_trades <= 0 or n < hold_days + 2:
+        return np.array([])
+
+    closes = df["Close"].values
+    resultados = []
+    max_start = max(1, n - 2)
+
+    for _ in range(n_sims):
+        capital = 100.0
+        starts = rng.integers(0, max_start, size=n_trades)
+        for s in starts:
+            entry_price = closes[s]
+            ret = None
+            for h in range(1, hold_days + 1):
+                idx = s + h
+                if idx >= n:
+                    break
+                r = closes[idx] / entry_price - 1
+                if r <= -stop_pct or r >= target_pct:
+                    ret = r
+                    break
+            if ret is None:
+                idx = min(s + hold_days, n - 1)
+                ret = closes[idx] / entry_price - 1
+            capital *= (1 + ret)
+        resultados.append(capital - 100)
+
+    return np.array(resultados)
+
+
+def build_montecarlo_chart(sim_returns: np.ndarray, actual_return: float) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=sim_returns, nbinsx=40, name="Timing aleatorio",
+        marker_color="rgba(148,163,184,0.6)",
+    ))
+    fig.add_vline(
+        x=actual_return, line_color="#00d4aa", line_width=2, line_dash="solid",
+        annotation_text=f"Estrategia ({actual_return:+.1f}%)",
+        annotation_font_color="#00d4aa",
+    )
+    fig.update_layout(
+        template="plotly_dark", height=340,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=30, b=0),
+        title=dict(text="Distribución de retornos con timing aleatorio", font=dict(size=12, color="#94a3b8")),
+        xaxis=dict(title="Retorno total %", gridcolor="rgba(255,255,255,0.04)"),
+        yaxis=dict(title="Frecuencia", gridcolor="rgba(255,255,255,0.04)"),
+        showlegend=False,
+    )
+    return fig
 
 
 def build_equity_chart(equity_s: pd.Series, bh_s: pd.Series, ticker: str) -> go.Figure:
@@ -1523,112 +1615,6 @@ def save_signal_snapshot(results_df: pd.DataFrame, macro: dict) -> None:
     _persist_signal_history(st.session_state[HIST_KEY])
 
 
-def resolve_signal_outcomes(hist_df: pd.DataFrame, data: dict, horizon: int = 5) -> pd.DataFrame:
-    """
-    Para cada señal histórica, busca el precio N ruedas después (dentro del período
-    de datos actualmente cargado) y clasifica el resultado:
-    - COMPRA/COMPRA FUERTE → Acierto si el retorno a horizon ruedas es positivo
-    - VENTA/VENTA FUERTE   → Acierto si el retorno a horizon ruedas es negativo
-    - NEUTRAL              → no se evalúa (no implica una acción)
-    Nota: sólo puede resolver señales cuyo ticker + fecha estén cubiertos por el
-    período histórico actualmente cargado (sidebar). Señales más viejas que ese
-    período, o muy recientes (sin `horizon` ruedas todavía), quedan "Pendiente".
-    """
-    df = hist_df.copy()
-    df["Timestamp_dt"] = pd.to_datetime(df["Timestamp"])
-
-    resultados, retornos, precios_fut = [], [], []
-    for _, row in df.iterrows():
-        sym = row["Ticker"]
-        ticker_ba = sym + ".BA"
-        df_price = data.get(ticker_ba)
-        señal = row["Señal"]
-
-        if df_price is None or df_price.empty or señal == "NEUTRAL":
-            resultados.append("N/A" if señal == "NEUTRAL" else "Sin datos")
-            retornos.append(None); precios_fut.append(None)
-            continue
-
-        close = df_price["Close"].dropna()
-        try:
-            idx = close.index
-            emit_date = pd.Timestamp(row["Timestamp_dt"]).tz_localize(None).normalize()
-            idx_naive = idx.tz_localize(None) if idx.tz is not None else idx
-            candidatos = idx_naive[idx_naive >= emit_date]
-            if len(candidatos) == 0:
-                resultados.append("Sin datos"); retornos.append(None); precios_fut.append(None)
-                continue
-            pos = idx_naive.get_indexer([candidatos[0]])[0]
-            target_pos = pos + horizon
-            if target_pos >= len(close):
-                resultados.append("Pendiente"); retornos.append(None); precios_fut.append(None)
-                continue
-
-            precio_emision = float(row["Precio $"])
-            precio_futuro  = float(close.iloc[target_pos])
-            ret = (precio_futuro / precio_emision - 1) * 100 if precio_emision else None
-        except Exception:
-            resultados.append("Sin datos"); retornos.append(None); precios_fut.append(None)
-            continue
-
-        precios_fut.append(round(precio_futuro, 2) if ret is not None else None)
-        retornos.append(round(ret, 2) if ret is not None else None)
-
-        if ret is None:
-            resultados.append("Sin datos")
-        elif señal in ("COMPRA FUERTE", "COMPRA"):
-            resultados.append("Acierto" if ret > 0 else "Fallo")
-        else:  # VENTA / VENTA FUERTE
-            resultados.append("Acierto" if ret < 0 else "Fallo")
-
-    df["Precio futuro"] = precios_fut
-    df["Retorno %"]     = retornos
-    df["Resultado"]     = resultados
-    return df
-
-
-def build_equity_curve_chart(evaluables: pd.DataFrame, merval_close: pd.Series | None) -> go.Figure:
-    """
-    Curva de equity acumulada (base 100) de las señales evaluadas, tomadas en orden
-    cronológico con tamaño equally-weighted, vs. el Merval en el mismo tramo. Es una
-    simplificación: no modela posiciones simultáneas ni tamaño real de cada operación,
-    sirve para ver la tendencia direccional del sistema.
-    """
-    df = evaluables.copy().sort_values("Timestamp_dt")
-
-    # Homogeneizar signo: en señales VENTA, un retorno de precio negativo es "a favor" del sistema
-    df["retorno_sistema"] = df.apply(
-        lambda r: r["Retorno %"] if r["Señal"] in ("COMPRA FUERTE", "COMPRA") else -r["Retorno %"],
-        axis=1,
-    )
-    df["equity"] = (1 + df["retorno_sistema"] / 100).cumprod() * 100
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["Timestamp_dt"], y=df["equity"], mode="lines+markers",
-        name="Sistema (señales)", line=dict(color="#4ade80", width=2),
-    ))
-
-    if merval_close is not None and not merval_close.empty:
-        mv_idx = merval_close.index.tz_localize(None) if merval_close.index.tz is not None else merval_close.index
-        mv = merval_close.copy()
-        mv.index = mv_idx
-        mv_norm = (mv / mv.iloc[0]) * 100
-        fig.add_trace(go.Scatter(
-            x=mv_norm.index, y=mv_norm.values, mode="lines",
-            name="Merval (buy & hold)", line=dict(color="#94a3b8", width=1.5, dash="dot"),
-        ))
-
-    fig.update_layout(
-        template="plotly_dark", height=380,
-        title="Equity acumulada de las señales evaluadas (base 100)",
-        xaxis_title="Fecha de señal", yaxis_title="Índice (base 100)",
-        legend=dict(orientation="h", y=1.12),
-        margin=dict(l=40, r=20, t=60, b=40),
-    )
-    return fig
-
-
 def build_history_chart(hist_df: pd.DataFrame, ticker: str) -> go.Figure:
     """Score histórico de un ticker a lo largo del tiempo."""
     df_t = hist_df[hist_df["Ticker"] == ticker].copy()
@@ -2228,6 +2214,102 @@ def main():
                 st.plotly_chart(build_score_chart(score_s, df_bt, bt_entry, trades_df),
                                 use_container_width=True)
 
+                st.divider()
+
+                # ── Validación estadística ──
+                st.markdown("### 🔬 Validación estadística")
+                st.caption(
+                    "Antes de confiar en las métricas de arriba conviene chequear dos cosas: si dependen de un "
+                    "tramo particular del período cargado, y si el timing de las señales realmente aporta algo "
+                    "sobre entrar en fechas al azar."
+                )
+
+                val_tab = st.radio(
+                    "Tipo de validación",
+                    ["📆 Consistencia por sub-períodos", "🎲 Monte Carlo vs. timing aleatorio"],
+                    horizontal=True, key="bt_val_tab",
+                )
+
+                if val_tab == "📆 Consistencia por sub-períodos":
+                    n_folds = st.slider("Cantidad de sub-períodos", 2, 6, 3, 1, key="bt_n_folds")
+                    folds_df = walk_forward_folds(df_bt, score_s, n_folds, bt_entry, bt_hold, bt_stop, bt_target)
+
+                    if folds_df.empty:
+                        st.info("El período cargado es corto para dividirlo en tantos sub-períodos con este hold. "
+                                "Ampliá el período histórico en el sidebar o reducí la cantidad de folds.")
+                    else:
+                        st.dataframe(
+                            folds_df.style
+                            .map(lambda v: "color:#4ade80;font-weight:700" if v > 0 else "color:#f87171;font-weight:700",
+                                 subset=["Retorno %"])
+                            .format({"Retorno %": "{:+.2f}%", "B&H %": "{:+.2f}%",
+                                     "Win Rate %": "{:.1f}%", "Sharpe": "{:.2f}", "Max DD %": "{:.2f}%"}),
+                            use_container_width=True, hide_index=True,
+                        )
+                        positivos = int((folds_df["Retorno %"] > 0).sum())
+                        st.caption(
+                            f"La estrategia fue positiva en {positivos} de {len(folds_df)} sub-períodos. "
+                            "Si el resultado general depende de uno o dos folds y el resto da negativo, es señal "
+                            "de que puede estar sobreajustada a ese tramo particular — no de que la estrategia "
+                            "funcione en general. Con pocos folds (2-3) esto es solo una primera lectura, no una "
+                            "prueba estadística fuerte."
+                        )
+
+                else:
+                    n_sims = st.slider("Simulaciones Monte Carlo", 50, 1000, 300, 50, key="bt_n_sims")
+
+                    if mets["N° Operaciones"] == 0:
+                        st.info("No hay operaciones en el backtest actual para comparar contra timing aleatorio.")
+                    else:
+                        with st.spinner("Simulando timing aleatorio…"):
+                            sim_returns = run_random_baseline(
+                                df_bt, mets["N° Operaciones"], bt_hold, bt_stop, bt_target,
+                                n_sims=n_sims, seed=42,
+                            )
+
+                        if len(sim_returns) == 0:
+                            st.info("Período muy corto para simular.")
+                        else:
+                            actual_ret = mets["Total Return %"]
+                            p_value    = float((sim_returns >= actual_ret).mean())
+
+                            mc1, mc2, mc3 = st.columns(3)
+                            mc1.metric("📈 Retorno de la estrategia", f"{actual_ret:+.1f}%")
+                            mc2.metric("🎲 Retorno aleatorio (promedio)", f"{sim_returns.mean():+.1f}%")
+                            mc3.metric("📊 Superó al azar en", f"{(1 - p_value) * 100:.0f}% de las simus")
+
+                            if p_value < 0.05:
+                                st.success(
+                                    f"El timing de las señales superó al timing aleatorio en el "
+                                    f"{(1 - p_value) * 100:.0f}% de las {n_sims} simulaciones — hay evidencia de "
+                                    f"que el score aporta algo más que casualidad en este ticker y período."
+                                )
+                            elif p_value < 0.20:
+                                st.warning(
+                                    f"El timing de las señales superó al azar en el {(1 - p_value) * 100:.0f}% de "
+                                    "las simulaciones — hay una tendencia a favor, pero no es una diferencia "
+                                    "contundente como para descartar que sea casualidad."
+                                )
+                            else:
+                                st.error(
+                                    f"El timing de las señales solo superó al azar en el {(1 - p_value) * 100:.0f}% "
+                                    "de las simulaciones. Con estos parámetros, entrar en fechas aleatorias (mismas "
+                                    "reglas de stop/target/hold) hubiera dado resultados similares o mejores — el "
+                                    "retorno de la estrategia probablemente viene del mercado en general (B&H), no "
+                                    "del timing de las señales."
+                                )
+
+                            st.plotly_chart(build_montecarlo_chart(sim_returns, actual_ret), use_container_width=True)
+
+                    st.caption(
+                        "⚠️ Este test compara únicamente el *timing de entrada*: mismas reglas de stop/target/hold, "
+                        "pero fechas al azar en vez de basadas en el score. No reemplaza una validación completa "
+                        "de la estrategia, pero sí detecta si el score realmente aporta información sobre cuándo "
+                        "entrar, o si el resultado se explica por el movimiento general del papel."
+                    )
+
+                st.divider()
+
                 # ── Tabla de operaciones ──
                 if not trades_df.empty:
                     st.subheader(f"📋 Operaciones simuladas ({len(trades_df)})")
@@ -2656,87 +2738,10 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     with tab9:
         st.subheader("🗂️ Control de Gestión")
-        st.caption("KPIs de performance del sistema de señales, calidad de datos y registro histórico persistente (signal_history.json).")
+        st.caption("Calidad de datos del universo filtrado y registro histórico de señales para consulta propia.")
 
         hist    = st.session_state.get(HIST_KEY, [])
         hist_df = pd.DataFrame(hist) if hist else pd.DataFrame()
-
-        # ═══ SECCIÓN 1 — PERFORMANCE DEL SISTEMA DE SEÑALES ═══════════════
-        st.markdown("### 📊 Performance del sistema de señales")
-
-        if hist_df.empty:
-            st.info("Aún no hay señales registradas. El historial se guarda automáticamente en cada carga de la app.")
-        else:
-            horizon = st.slider(
-                "Horizonte de evaluación (ruedas hábiles)", 3, 20, 5, 1,
-                help="A cuántas ruedas después de emitida la señal se mide el resultado (retorno y acierto/fallo).",
-                key="kpi_horizon",
-            )
-
-            resolved   = resolve_signal_outcomes(hist_df, data, horizon=horizon)
-            evaluables = resolved[resolved["Resultado"].isin(["Acierto", "Fallo"])]
-
-            if evaluables.empty:
-                st.info(
-                    "Ninguna señal registrada tiene todavía suficientes ruedas posteriores, dentro del período "
-                    "histórico cargado en el sidebar, para evaluarse. Es esperable al empezar a usar el historial "
-                    "persistente — con el uso diario de la app este panel se va a ir poblando."
-                )
-            else:
-                hit_ratio = (evaluables["Resultado"] == "Acierto").mean() * 100
-                n_eval    = len(evaluables)
-                ret_prom  = evaluables["Retorno %"].mean()
-                aciertos_ret = evaluables.loc[evaluables["Resultado"] == "Acierto", "Retorno %"].mean()
-                fallos_ret   = evaluables.loc[evaluables["Resultado"] == "Fallo",   "Retorno %"].mean()
-
-                k1, k2, k3, k4 = st.columns(4)
-                k1.metric("🎯 Hit ratio global", f"{hit_ratio:.0f}%", f"{n_eval} señales evaluadas")
-                k2.metric("📐 Retorno promedio", f"{ret_prom:+.2f}%", f"a {horizon} ruedas")
-                k3.metric("✅ Retorno prom. aciertos", f"{aciertos_ret:+.2f}%" if pd.notna(aciertos_ret) else "—")
-                k4.metric("🔴 Retorno prom. fallos",   f"{fallos_ret:+.2f}%"   if pd.notna(fallos_ret)   else "—")
-
-                st.markdown("#### Hit ratio por tipo de señal")
-                by_señal = (
-                    evaluables.groupby("Señal")
-                    .agg(N=("Resultado", "count"),
-                         Hit_ratio=("Resultado", lambda s: round((s == "Acierto").mean() * 100, 1)),
-                         Retorno_prom=("Retorno %", "mean"))
-                    .rename(columns={"Hit_ratio": "Hit ratio %", "Retorno_prom": "Retorno prom. %"})
-                    .sort_values("Hit ratio %", ascending=False)
-                )
-                st.dataframe(
-                    by_señal.style.format({"Hit ratio %": "{:.1f}%", "Retorno prom. %": "{:+.2f}%"}),
-                    use_container_width=True,
-                )
-
-                st.markdown("#### Hit ratio por sector")
-                if "Sector" in evaluables.columns and evaluables["Sector"].nunique() > 1:
-                    by_sector = (
-                        evaluables.groupby("Sector")
-                        .agg(N=("Resultado", "count"),
-                             Hit_ratio=("Resultado", lambda s: round((s == "Acierto").mean() * 100, 1)))
-                        .rename(columns={"Hit_ratio": "Hit ratio %"})
-                        .sort_values("Hit ratio %", ascending=False)
-                    )
-                    st.dataframe(by_sector.style.format({"Hit ratio %": "{:.1f}%"}), use_container_width=True)
-                else:
-                    st.caption("Se necesita historial de más de un sector para este desglose "
-                               "(las señales guardadas antes de esta actualización no tienen Sector registrado).")
-
-                st.caption(
-                    "⚠️ El hit ratio sólo cubre señales cuya fecha de emisión y horizonte caen dentro del período "
-                    "histórico cargado en el sidebar. Señales muy recientes figuran como 'Pendiente' hasta tener "
-                    "suficientes ruedas posteriores."
-                )
-
-                st.markdown("#### Curva de equity acumulada vs Merval")
-                merval_close = fetch_merval_close(period)
-                if merval_close is None:
-                    st.caption("No se pudo descargar el Merval (^MERV) para la comparación en esta carga.")
-                fig_equity = build_equity_curve_chart(evaluables, merval_close)
-                st.plotly_chart(fig_equity, use_container_width=True)
-
-        st.divider()
 
         # ═══ SECCIÓN 2 — CALIDAD DE DATOS ══════════════════════════════════
         st.markdown("### 🔍 Calidad de datos")
@@ -2785,8 +2790,8 @@ def main():
         st.divider()
 
         # ═══ SECCIÓN 3 — HISTORIAL DETALLADO ═══════════════════════════════
-        st.markdown("### 📜 Historial de señales (detalle)")
-        st.caption("Registro persistente en signal_history.json — se conserva entre sesiones y reinicios de la app. Exportá el CSV si querés analizarlo fuera de la app.")
+        st.markdown("### 📜 Historial de señales (registro)")
+        st.caption("Log simple de cada estado del screener, sin análisis automático de acierto/fallo. Se guarda en signal_history.json mientras la app siga corriendo, pero no está garantizado entre reinicios de Streamlit Cloud — exportá el CSV si querés conservarlo con certeza.")
 
         if not hist:
             st.info("El historial se genera automáticamente al cargar la app. Volvé a esta tab después de algunas actualizaciones.")
