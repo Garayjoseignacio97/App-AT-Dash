@@ -855,6 +855,55 @@ def build_montecarlo_chart(sim_returns: np.ndarray, actual_return: float) -> go.
     return fig
 
 
+def parameter_sensitivity_grid(
+    df: pd.DataFrame, score_s: pd.Series,
+    entry_range: list[int], hold_range: list[int],
+    stop_pct: float, target_pct: float,
+) -> pd.DataFrame:
+    """
+    Corre el backtest en una grilla de (score mínimo de entrada) x (días de hold),
+    con stop/target fijos, para chequear si el resultado depende de haber
+    encontrado exactamente ese combo de parámetros o es robusto en un entorno
+    razonable. Una celda buena rodeada de celdas mediocres es la firma clásica
+    de un resultado ajustado a ruido más que a una ventaja real y repetible.
+    """
+    filas = []
+    for entry in entry_range:
+        for hold in hold_range:
+            trades_g, eq_g, bh_g = run_backtest(df, score_s, entry, hold, stop_pct, target_pct)
+            mets_g = backtest_metrics(trades_g, eq_g, bh_g)
+            filas.append({
+                "Score entrada": entry,
+                "Hold (ruedas)": hold,
+                "Retorno %":     mets_g["Total Return %"],
+                "Sharpe":        mets_g["Sharpe"],
+                "Operaciones":   mets_g["N° Operaciones"],
+                "Win Rate %":    mets_g["Win Rate %"],
+            })
+    return pd.DataFrame(filas)
+
+
+def build_sensitivity_heatmap(grid_df: pd.DataFrame, value_col: str = "Retorno %") -> go.Figure:
+    pivot = grid_df.pivot(index="Hold (ruedas)", columns="Score entrada", values=value_col)
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values, x=pivot.columns, y=pivot.index,
+        colorscale="RdYlGn", zmid=0,
+        colorbar=dict(title=dict(text=value_col, font=dict(color="#94a3b8"))),
+        text=np.round(pivot.values, 1), texttemplate="%{text}",
+        hovertemplate="Score≥%{x} · Hold=%{y}d<br>" + value_col + ": %{z}<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark", height=380,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#0e1117",
+        font=dict(color="#cbd5e1", size=11),
+        margin=dict(l=0, r=0, t=30, b=0),
+        title=dict(text=f"Sensibilidad de parámetros — {value_col}", font=dict(size=12, color="#94a3b8")),
+        xaxis=dict(title="Score mínimo de entrada"),
+        yaxis=dict(title="Días de hold"),
+    )
+    return fig
+
+
 def build_equity_chart(equity_s: pd.Series, bh_s: pd.Series, ticker: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -2226,7 +2275,7 @@ def main():
 
                 val_tab = st.radio(
                     "Tipo de validación",
-                    ["📆 Consistencia por sub-períodos", "🎲 Monte Carlo vs. timing aleatorio"],
+                    ["📆 Consistencia por sub-períodos", "🎲 Monte Carlo vs. timing aleatorio", "🧩 Sensibilidad de parámetros"],
                     horizontal=True, key="bt_val_tab",
                 )
 
@@ -2255,7 +2304,7 @@ def main():
                             "prueba estadística fuerte."
                         )
 
-                else:
+                elif val_tab == "🎲 Monte Carlo vs. timing aleatorio":
                     n_sims = st.slider("Simulaciones Monte Carlo", 50, 1000, 300, 50, key="bt_n_sims")
 
                     if mets["N° Operaciones"] == 0:
@@ -2307,6 +2356,61 @@ def main():
                         "de la estrategia, pero sí detecta si el score realmente aporta información sobre cuándo "
                         "entrar, o si el resultado se explica por el movimiento general del papel."
                     )
+
+                else:  # 🧩 Sensibilidad de parámetros
+                    st.caption(
+                        "Corre el backtest en una grilla de score de entrada × días de hold (con stop/target fijos "
+                        "en los valores de arriba) para ver si el resultado depende de haber encontrado exactamente "
+                        "ese combo, o es robusto en un entorno razonable de parámetros."
+                    )
+                    sp1, sp2 = st.columns(2)
+                    with sp1:
+                        entry_lo, entry_hi = st.slider(
+                            "Rango de score de entrada", 1, 8,
+                            (max(1, bt_entry - 2), min(8, bt_entry + 2)), key="bt_sens_entry",
+                        )
+                    with sp2:
+                        hold_lo, hold_hi = st.slider(
+                            "Rango de días de hold", 3, 30,
+                            (max(3, bt_hold - 6), min(30, bt_hold + 6)), key="bt_sens_hold",
+                        )
+
+                    entry_range = list(range(entry_lo, entry_hi + 1))
+                    hold_step   = max(1, (hold_hi - hold_lo) // 6) or 1
+                    hold_range  = sorted(set(list(range(hold_lo, hold_hi + 1, hold_step)) + [hold_hi]))
+
+                    with st.spinner("Corriendo grilla de sensibilidad…"):
+                        grid_df = parameter_sensitivity_grid(df_bt, score_s, entry_range, hold_range, bt_stop, bt_target)
+
+                    if grid_df.empty:
+                        st.info("No se pudo construir la grilla con este rango de parámetros.")
+                    else:
+                        st.plotly_chart(build_sensitivity_heatmap(grid_df, "Retorno %"), use_container_width=True)
+
+                        rets = grid_df["Retorno %"]
+                        actual_cell = grid_df[
+                            (grid_df["Score entrada"] == bt_entry) & (grid_df["Hold (ruedas)"] == bt_hold)
+                        ]
+                        if not actual_cell.empty:
+                            actual_val = float(actual_cell["Retorno %"].iloc[0])
+                            percentil_actual = float((rets < actual_val).mean() * 100)
+                            st.caption(
+                                f"La combinación actual del backtest (score≥{bt_entry}, hold={bt_hold}d) da "
+                                f"{actual_val:+.1f}% y queda en el percentil {percentil_actual:.0f} de las "
+                                f"{len(grid_df)} combinaciones probadas. Si es una de las mejores celdas de toda la "
+                                "grilla y las combinaciones vecinas son mucho peores, es probable que el resultado "
+                                "sea ruido ajustado a ese combo puntual — no algo repetible en la práctica. Si en "
+                                "cambio hay una zona amplia de la grilla con resultados parecidos, es una señal más "
+                                "sólida de que la ventaja es real."
+                            )
+
+                        with st.expander("Ver tabla completa de la grilla"):
+                            st.dataframe(
+                                grid_df.style.format(
+                                    {"Retorno %": "{:+.2f}%", "Sharpe": "{:.2f}", "Win Rate %": "{:.1f}%"}
+                                ),
+                                use_container_width=True, hide_index=True,
+                            )
 
                 st.divider()
 
